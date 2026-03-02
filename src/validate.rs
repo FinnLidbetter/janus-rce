@@ -25,6 +25,41 @@ pub enum ValidationError {
 }
 
 // ---------------------------------------------------------------------------
+// Shell metacharacter guard
+// ---------------------------------------------------------------------------
+
+/// Returns an error if `value` contains any character that has special meaning
+/// in POSIX-compatible shells.
+///
+/// Although arguments are passed to child processes via `Command::args()` (no
+/// shell involved), child programs may themselves invoke a shell or call
+/// `system(3)`. Rejecting metacharacters here provides defence-in-depth and
+/// keeps all validated values safe for display, logging, and any downstream
+/// shell invocation a child might make.
+fn reject_shell_metacharacters(arg: &str, value: &str) -> Result<(), ValidationError> {
+    // Full POSIX special-character set plus common control characters.
+    const DANGEROUS: &[char] = &[
+        // Command / argument separators
+        '|', '&', ';', // Expansions
+        '$', '`', // Grouping / redirection
+        '(', ')', '{', '}', '<', '>', // Quoting
+        '"', '\'', '\\', // Glob / pattern characters
+        '*', '?', '[', ']', '^', // Miscellaneous shell specials
+        '!', '~', '#', // Control characters
+        '\n', '\r', '\0',
+    ];
+
+    if let Some(c) = value.chars().find(|c| DANGEROUS.contains(c)) {
+        return Err(ValidationError::InvalidArgValue {
+            arg: arg.to_string(),
+            reason: format!("contains a disallowed shell metacharacter: {:?}", c),
+        });
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
@@ -78,6 +113,7 @@ pub fn validate(
                         arg: arg_spec.name.clone(),
                         reason: "must be a string".into(),
                     })?;
+                reject_shell_metacharacters(&arg_spec.name, v)?;
                 if !values.iter().any(|allowed| allowed == v) {
                     return Err(ValidationError::InvalidArgValue {
                         arg: arg_spec.name.clone(),
@@ -95,6 +131,7 @@ pub fn validate(
                         arg: arg_spec.name.clone(),
                         reason: "must be a string".into(),
                     })?;
+                reject_shell_metacharacters(&arg_spec.name, v)?;
                 if !compiled.is_match(v) {
                     return Err(ValidationError::InvalidArgValue {
                         arg: arg_spec.name.clone(),
@@ -112,6 +149,7 @@ pub fn validate(
                         arg: arg_spec.name.clone(),
                         reason: "must be a string".into(),
                     })?;
+                reject_shell_metacharacters(&arg_spec.name, v)?;
                 let candidate = std::path::Path::new(v);
                 if !candidate.is_absolute() {
                     return Err(ValidationError::InvalidArgValue {
@@ -174,7 +212,7 @@ mod tests {
     };
     use crate::routes::RunRequest;
 
-    use super::{ValidationError, validate};
+    use super::{ValidatedCommand, ValidationError, validate};
 
     fn test_config() -> LoadedConfig {
         LoadedConfig {
@@ -474,5 +512,94 @@ mod tests {
         let result = validate(&req("greet", vec![("format", json!("text"))]), &config).unwrap();
         assert_eq!(result.executable, PathBuf::from("/usr/bin/true"));
         assert!(result.working_dir.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Shell metacharacter tests
+    // ------------------------------------------------------------------
+
+    /// Helper: assert that `result` is an InvalidArgValue whose reason
+    /// mentions "shell metacharacter".
+    fn assert_metachar_error(result: Result<ValidatedCommand, ValidationError>) {
+        match result {
+            Err(ValidationError::InvalidArgValue { reason, .. }) => {
+                assert!(
+                    reason.contains("shell metacharacter"),
+                    "expected 'shell metacharacter' in reason: {reason}"
+                );
+            }
+            other => panic!("expected InvalidArgValue (metachar), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn metachar_semicolon_in_enum_rejected() {
+        // The metacharacter check fires before the "not in allowed values"
+        // check, so the error reason must mention "shell metacharacter".
+        let config = test_config();
+        assert_metachar_error(validate(
+            &req("greet", vec![("format", json!("text;"))]),
+            &config,
+        ));
+    }
+
+    #[test]
+    fn metachar_pipe_in_enum_rejected() {
+        let config = test_config();
+        assert_metachar_error(validate(
+            &req("greet", vec![("format", json!("text|json"))]),
+            &config,
+        ));
+    }
+
+    #[test]
+    fn metachar_dollar_in_pattern_rejected() {
+        // "$USER" could expand to a username in a shell — reject even though
+        // the pattern `^[a-zA-Z]+$` would never match it anyway.
+        let config = test_config();
+        assert_metachar_error(validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("name", json!("$USER"))],
+            ),
+            &config,
+        ));
+    }
+
+    #[test]
+    fn metachar_backtick_in_pattern_rejected() {
+        let config = test_config();
+        assert_metachar_error(validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("name", json!("`id`"))],
+            ),
+            &config,
+        ));
+    }
+
+    #[test]
+    fn metachar_newline_in_enum_rejected() {
+        let config = test_config();
+        assert_metachar_error(validate(
+            &req("greet", vec![("format", json!("text\nmore"))]),
+            &config,
+        ));
+    }
+
+    #[test]
+    fn metachar_null_byte_in_enum_rejected() {
+        let config = test_config();
+        assert_metachar_error(validate(
+            &req("greet", vec![("format", json!("text\x00"))]),
+            &config,
+        ));
+    }
+
+    #[test]
+    fn metachar_safe_value_accepted() {
+        // Plain alphanumeric + hyphen/dot values must not be rejected.
+        let config = test_config();
+        assert!(validate(&req("greet", vec![("format", json!("text"))]), &config).is_ok());
     }
 }
