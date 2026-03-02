@@ -8,7 +8,7 @@
 //! # Environment isolation
 //!
 //! Child processes are started with [`Command::env_clear`] followed by a small
-//! allow-list of non-sensitive variables (see [`safe_env`]).  This ensures
+//! allow-list of non-sensitive variables (see `safe_env`).  This ensures
 //! that secrets such as `JANUS_TOKEN` are never inherited by child processes.
 //!
 //! # Client disconnect
@@ -145,7 +145,7 @@ pub fn run_command(cmd: ValidatedCommand) -> EventStream![] {
 /// Spawns `cmd` as a child process with piped stdout/stderr.
 ///
 /// The child's environment is cleared and replaced with the safe allow-list
-/// returned by [`safe_env`].  `kill_on_drop(true)` is set so that the child
+/// returned by `safe_env`.  `kill_on_drop(true)` is set so that the child
 /// is terminated if the returned [`Child`] handle is dropped.
 ///
 /// [`Child`]: tokio::process::Child
