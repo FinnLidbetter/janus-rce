@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Disable incremental compilation — CI caches build artefacts between runs,
+  # so incremental compilation buys nothing but wastes cache space.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # 1. Formatting — fast, no cache needed
+  # ─────────────────────────────────────────────────────────
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # ─────────────────────────────────────────────────────────
+  # 2. Lint
+  # ─────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # .cargo/config.toml sets target-dir to /tmp/janus-rce-target to avoid
+          # SIGBUS on macOS/Docker-mounted volumes.  Tell the cache action where
+          # the artefacts actually live.
+          workspaces: ". -> /tmp/janus-rce-target"
+      # --all-targets lints test code and integration tests as well.
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # ─────────────────────────────────────────────────────────
+  # 3. Tests (unit, integration, and doc-tests)
+  # ─────────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> /tmp/janus-rce-target"
+      - run: cargo test
+
+  # ─────────────────────────────────────────────────────────
+  # 4. Documentation — ensure all doc comments are valid
+  # ─────────────────────────────────────────────────────────
+  doc:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      # Treat broken intra-doc links and missing docs as errors.
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> /tmp/janus-rce-target"
+      - run: cargo doc --no-deps
+
+  # ─────────────────────────────────────────────────────────
+  # 5. Security audit — check dependencies for known CVEs
+  #
+  # Requires Cargo.lock to be committed (recommended for binaries).
+  # ─────────────────────────────────────────────────────────
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> /tmp/janus-rce-target"
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
