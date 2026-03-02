@@ -1,0 +1,127 @@
+# janus.toml — example configuration for janus-rce
+#
+# This file is a template. Copy it, fill in your project paths and token, and
+# keep the copy out of version control (add it to .gitignore).
+#
+# Configuration can also be supplied via environment variables:
+#   JANUS_TOKEN   — bearer token (takes precedence over server.token below)
+#   JANUS_CONFIG  — path to this file (default: ./janus.toml)
+
+[server]
+port = 9876
+
+# Bind to loopback only. The Docker container reaches this via a published
+# port mapping. NEVER set this to 0.0.0.0 without a separate network-level
+# access control.
+bind = "127.0.0.1"
+
+# Bearer token. Prefer setting JANUS_TOKEN in the environment so the secret
+# never lives in a file. If both are absent the server will refuse to start.
+# token = "replace-with-a-long-random-secret"
+
+# ---------------------------------------------------------------------------
+# xcodebuild — build
+# ---------------------------------------------------------------------------
+[[commands]]
+name = "build"
+executable = "/usr/bin/xcodebuild"
+working_dir = "/path/to/your/project"
+
+  # Scheme is required; must be one of the explicitly listed values.
+  [[commands.args]]
+  name = "scheme"
+  flag = "-scheme"
+  required = true
+  type = "enum"
+  values = ["MyApp", "MyAppTests"]
+
+  # Build configuration; optional (xcodebuild defaults to Debug).
+  [[commands.args]]
+  name = "configuration"
+  flag = "-configuration"
+  required = false
+  type = "enum"
+  values = ["Debug", "Release"]
+
+  # Destination string; validated against a regex pattern.
+  # The pattern is automatically anchored (^...$) even without explicit anchors.
+  [[commands.args]]
+  name = "destination"
+  flag = "-destination"
+  required = false
+  type = "pattern"
+  pattern = "platform=macOS,arch=(x86_64|arm64)"
+
+  # Derived data path; must be an absolute path within one of the listed dirs.
+  [[commands.args]]
+  name = "derived_data_path"
+  flag = "-derivedDataPath"
+  required = false
+  type = "path"
+  within = ["/private/tmp"]
+
+  # Boolean flag: true → passes -quiet, false/absent → omits it.
+  [[commands.args]]
+  name = "quiet"
+  flag = "-quiet"
+  required = false
+  type = "bool"
+
+# ---------------------------------------------------------------------------
+# xcodebuild — test
+# ---------------------------------------------------------------------------
+[[commands]]
+name = "test"
+executable = "/usr/bin/xcodebuild"
+working_dir = "/path/to/your/project"
+
+  [[commands.args]]
+  name = "scheme"
+  flag = "-scheme"
+  required = true
+  type = "enum"
+  values = ["MyAppTests", "MyAppUITests"]
+
+  [[commands.args]]
+  name = "destination"
+  flag = "-destination"
+  required = true
+  type = "pattern"
+  pattern = "platform=macOS,arch=(x86_64|arm64)"
+
+  [[commands.args]]
+  name = "result_bundle_path"
+  flag = "-resultBundlePath"
+  required = false
+  type = "path"
+  within = ["/private/tmp"]
+
+# ---------------------------------------------------------------------------
+# xcodebuild — clean
+# ---------------------------------------------------------------------------
+[[commands]]
+name = "clean"
+executable = "/usr/bin/xcodebuild"
+working_dir = "/path/to/your/project"
+
+  [[commands.args]]
+  name = "scheme"
+  flag = "-scheme"
+  required = true
+  type = "enum"
+  values = ["MyApp"]
+
+# ---------------------------------------------------------------------------
+# xcrun simctl — list simulators
+# ---------------------------------------------------------------------------
+[[commands]]
+name = "simctl-list"
+executable = "/usr/bin/xcrun"
+# No working_dir required for simctl.
+
+  [[commands.args]]
+  name = "output_format"
+  flag = "--output-format"
+  required = false
+  type = "enum"
+  values = ["json", "human-readable"]

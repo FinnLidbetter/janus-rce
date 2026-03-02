@@ -1,0 +1,4 @@
+# Build the target directory on the local Linux filesystem to avoid SIGBUS
+# errors caused by LLVM mmap operations on the Docker-mounted macOS volume.
+[build]
+target-dir = "/tmp/janus-rce-target"

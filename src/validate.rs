@@ -1,0 +1,478 @@
+use std::path::PathBuf;
+
+use crate::config::{LoadedArgType, LoadedConfig};
+use crate::routes::RunRequest;
+
+// ---------------------------------------------------------------------------
+// Output types
+// ---------------------------------------------------------------------------
+
+/// A fully-validated command ready to hand to the executor.
+/// `argv` is a flat, ordered list of CLI arguments with no shell interpretation.
+#[derive(Debug)]
+pub struct ValidatedCommand {
+    pub executable: PathBuf,
+    pub working_dir: Option<PathBuf>,
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug)]
+pub enum ValidationError {
+    CommandNotFound,
+    UnknownArgs(Vec<String>),
+    MissingRequiredArgs(Vec<String>),
+    InvalidArgValue { arg: String, reason: String },
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+pub fn validate(
+    request: &RunRequest,
+    config: &LoadedConfig,
+) -> Result<ValidatedCommand, ValidationError> {
+    // 1. Look up the command.
+    let spec = config
+        .find_command(&request.command)
+        .ok_or(ValidationError::CommandNotFound)?;
+
+    // 2. Reject any args not declared in the config.
+    let declared: std::collections::HashSet<&str> =
+        spec.args.iter().map(|a| a.name.as_str()).collect();
+    let unknown: Vec<String> = request
+        .args
+        .keys()
+        .filter(|k| !declared.contains(k.as_str()))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        return Err(ValidationError::UnknownArgs(unknown));
+    }
+
+    // 3. Ensure all required args are present.
+    let missing: Vec<String> = spec
+        .args
+        .iter()
+        .filter(|a| a.required && !request.args.contains_key(&a.name))
+        .map(|a| a.name.clone())
+        .collect();
+    if !missing.is_empty() {
+        return Err(ValidationError::MissingRequiredArgs(missing));
+    }
+
+    // 4. Validate each arg value and build the argv list in config declaration order.
+    let mut argv: Vec<String> = Vec::new();
+
+    for arg_spec in &spec.args {
+        let raw_value = match request.args.get(&arg_spec.name) {
+            Some(v) => v,
+            None => continue, // optional and absent — skip
+        };
+
+        match &arg_spec.arg_type {
+            LoadedArgType::Enum { values } => {
+                let v = raw_value
+                    .as_str()
+                    .ok_or_else(|| ValidationError::InvalidArgValue {
+                        arg: arg_spec.name.clone(),
+                        reason: "must be a string".into(),
+                    })?;
+                if !values.iter().any(|allowed| allowed == v) {
+                    return Err(ValidationError::InvalidArgValue {
+                        arg: arg_spec.name.clone(),
+                        reason: format!("'{}' is not one of the allowed values: {:?}", v, values),
+                    });
+                }
+                argv.push(arg_spec.flag.clone());
+                argv.push(v.to_string());
+            }
+
+            LoadedArgType::Pattern { compiled } => {
+                let v = raw_value
+                    .as_str()
+                    .ok_or_else(|| ValidationError::InvalidArgValue {
+                        arg: arg_spec.name.clone(),
+                        reason: "must be a string".into(),
+                    })?;
+                if !compiled.is_match(v) {
+                    return Err(ValidationError::InvalidArgValue {
+                        arg: arg_spec.name.clone(),
+                        reason: format!("'{}' does not match the required pattern", v),
+                    });
+                }
+                argv.push(arg_spec.flag.clone());
+                argv.push(v.to_string());
+            }
+
+            LoadedArgType::Path { within } => {
+                let v = raw_value
+                    .as_str()
+                    .ok_or_else(|| ValidationError::InvalidArgValue {
+                        arg: arg_spec.name.clone(),
+                        reason: "must be a string".into(),
+                    })?;
+                let candidate = std::path::Path::new(v);
+                if !candidate.is_absolute() {
+                    return Err(ValidationError::InvalidArgValue {
+                        arg: arg_spec.name.clone(),
+                        reason: "path must be absolute".into(),
+                    });
+                }
+                let canonical =
+                    candidate
+                        .canonicalize()
+                        .map_err(|_| ValidationError::InvalidArgValue {
+                            arg: arg_spec.name.clone(),
+                            reason: format!("'{}' cannot be resolved — does the path exist?", v),
+                        })?;
+                let allowed = within.iter().any(|w| canonical.starts_with(w));
+                if !allowed {
+                    return Err(ValidationError::InvalidArgValue {
+                        arg: arg_spec.name.clone(),
+                        reason: format!("'{}' is not within any allowed directory", v),
+                    });
+                }
+                // Pass the original string value, not the canonicalized form.
+                argv.push(arg_spec.flag.clone());
+                argv.push(v.to_string());
+            }
+
+            LoadedArgType::Bool => {
+                let v = raw_value
+                    .as_bool()
+                    .ok_or_else(|| ValidationError::InvalidArgValue {
+                        arg: arg_spec.name.clone(),
+                        reason: "must be a boolean".into(),
+                    })?;
+                if v {
+                    // Boolean flag: present means "true", no value argument.
+                    argv.push(arg_spec.flag.clone());
+                }
+                // false — omit the flag entirely.
+            }
+        }
+    }
+
+    Ok(ValidatedCommand {
+        executable: spec.executable.clone(),
+        working_dir: spec.working_dir.clone(),
+        argv,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use regex::Regex;
+    use serde_json::json;
+
+    use crate::config::{
+        LoadedArgSpec, LoadedArgType, LoadedCommandSpec, LoadedConfig, ServerConfig,
+    };
+    use crate::routes::RunRequest;
+
+    use super::{ValidationError, validate};
+
+    fn test_config() -> LoadedConfig {
+        LoadedConfig {
+            server: ServerConfig {
+                port: 8080,
+                bind: "127.0.0.1".into(),
+                token: None,
+            },
+            token: "test-token".into(),
+            commands: vec![LoadedCommandSpec {
+                name: "greet".into(),
+                executable: PathBuf::from("/usr/bin/true"),
+                working_dir: None,
+                args: vec![
+                    LoadedArgSpec {
+                        name: "format".into(),
+                        flag: "--format".into(),
+                        required: true,
+                        arg_type: LoadedArgType::Enum {
+                            values: vec!["text".into(), "json".into()],
+                        },
+                    },
+                    LoadedArgSpec {
+                        name: "name".into(),
+                        flag: "--name".into(),
+                        required: false,
+                        arg_type: LoadedArgType::Pattern {
+                            compiled: Regex::new("^[a-zA-Z]+$").unwrap(),
+                        },
+                    },
+                    LoadedArgSpec {
+                        name: "verbose".into(),
+                        flag: "--verbose".into(),
+                        required: false,
+                        arg_type: LoadedArgType::Bool,
+                    },
+                    LoadedArgSpec {
+                        name: "output".into(),
+                        flag: "--output".into(),
+                        required: false,
+                        arg_type: LoadedArgType::Path {
+                            within: vec![PathBuf::from("/tmp").canonicalize().unwrap()],
+                        },
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn req(command: &str, args: Vec<(&str, serde_json::Value)>) -> RunRequest {
+        RunRequest {
+            command: command.into(),
+            args: args
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<HashMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn unknown_command() {
+        let config = test_config();
+        let result = validate(&req("nope", vec![]), &config);
+        assert!(matches!(result, Err(ValidationError::CommandNotFound)));
+    }
+
+    #[test]
+    fn unknown_args_rejected() {
+        let config = test_config();
+        let result = validate(&req("greet", vec![("unknown", json!("value"))]), &config);
+        match result {
+            Err(ValidationError::UnknownArgs(args)) => {
+                assert_eq!(args, vec!["unknown"]);
+            }
+            other => panic!("expected UnknownArgs, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn missing_required_arg() {
+        let config = test_config();
+        let result = validate(&req("greet", vec![]), &config);
+        match result {
+            Err(ValidationError::MissingRequiredArgs(args)) => {
+                assert_eq!(args, vec!["format"]);
+            }
+            other => panic!("expected MissingRequiredArgs, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_valid() {
+        let config = test_config();
+        let result = validate(&req("greet", vec![("format", json!("text"))]), &config).unwrap();
+        assert_eq!(result.argv, vec!["--format", "text"]);
+    }
+
+    #[test]
+    fn enum_invalid_value() {
+        let config = test_config();
+        let result = validate(&req("greet", vec![("format", json!("xml"))]), &config);
+        assert!(matches!(
+            result,
+            Err(ValidationError::InvalidArgValue { .. })
+        ));
+    }
+
+    #[test]
+    fn enum_non_string_value() {
+        let config = test_config();
+        let result = validate(&req("greet", vec![("format", json!(42))]), &config);
+        assert!(matches!(
+            result,
+            Err(ValidationError::InvalidArgValue { .. })
+        ));
+    }
+
+    #[test]
+    fn pattern_valid() {
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("name", json!("Alice"))],
+            ),
+            &config,
+        )
+        .unwrap();
+        assert!(result.argv.contains(&"--name".to_string()));
+        assert!(result.argv.contains(&"Alice".to_string()));
+    }
+
+    #[test]
+    fn pattern_no_match() {
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("name", json!("Alice123"))],
+            ),
+            &config,
+        );
+        assert!(matches!(
+            result,
+            Err(ValidationError::InvalidArgValue { .. })
+        ));
+    }
+
+    #[test]
+    fn bool_true_adds_flag() {
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("verbose", json!(true))],
+            ),
+            &config,
+        )
+        .unwrap();
+        assert!(result.argv.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn bool_false_omits_flag() {
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("verbose", json!(false))],
+            ),
+            &config,
+        )
+        .unwrap();
+        assert!(!result.argv.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn bool_non_bool_rejected() {
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("verbose", json!("yes"))],
+            ),
+            &config,
+        );
+        assert!(matches!(
+            result,
+            Err(ValidationError::InvalidArgValue { .. })
+        ));
+    }
+
+    #[test]
+    fn path_valid() {
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("output", json!("/tmp"))],
+            ),
+            &config,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn path_relative_rejected() {
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("output", json!("relative"))],
+            ),
+            &config,
+        );
+        match result {
+            Err(ValidationError::InvalidArgValue { reason, .. }) => {
+                assert!(
+                    reason.contains("must be absolute"),
+                    "expected 'must be absolute' in: {reason}"
+                );
+            }
+            other => panic!("expected InvalidArgValue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn path_outside_rejected() {
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("output", json!("/usr"))],
+            ),
+            &config,
+        );
+        match result {
+            Err(ValidationError::InvalidArgValue { reason, .. }) => {
+                assert!(
+                    reason.contains("not within any allowed"),
+                    "expected 'not within any allowed' in: {reason}"
+                );
+            }
+            other => panic!("expected InvalidArgValue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn path_nonexistent_rejected() {
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![
+                    ("format", json!("text")),
+                    ("output", json!("/tmp/janus_no_such_path_xyz")),
+                ],
+            ),
+            &config,
+        );
+        assert!(matches!(
+            result,
+            Err(ValidationError::InvalidArgValue { .. })
+        ));
+    }
+
+    #[test]
+    fn argv_order_follows_config() {
+        let config = test_config();
+        // Supply args in reverse declaration order; argv must still follow config order.
+        let result = validate(
+            &req(
+                "greet",
+                vec![
+                    ("output", json!("/tmp")),
+                    ("verbose", json!(true)),
+                    ("name", json!("Alice")),
+                    ("format", json!("text")),
+                ],
+            ),
+            &config,
+        )
+        .unwrap();
+        let argv = &result.argv;
+        let format_pos = argv.iter().position(|x| x == "--format").unwrap();
+        let name_pos = argv.iter().position(|x| x == "--name").unwrap();
+        let verbose_pos = argv.iter().position(|x| x == "--verbose").unwrap();
+        let output_pos = argv.iter().position(|x| x == "--output").unwrap();
+        assert!(format_pos < name_pos);
+        assert!(name_pos < verbose_pos);
+        assert!(verbose_pos < output_pos);
+    }
+
+    #[test]
+    fn executable_and_workdir_passthrough() {
+        let config = test_config();
+        let result = validate(&req("greet", vec![("format", json!("text"))]), &config).unwrap();
+        assert_eq!(result.executable, PathBuf::from("/usr/bin/true"));
+        assert!(result.working_dir.is_none());
+    }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "janus-rce"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "janus-rce"
+path = "src/main.rs"
+
+[lib]
+name = "janus_rce"
+path = "src/lib.rs"
+
+[dependencies]
+rocket       = { git = "https://github.com/rwf2/Rocket.git", branch = "master", features = ["json", "trace"] }
+figment      = { version = "0.10", features = ["toml", "env"] }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+tokio        = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["io-util"] }
+regex        = "1"
+anyhow       = "1"
+tracing      = "0.1"
+subtle       = "2"
