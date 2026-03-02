@@ -33,6 +33,21 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("janus-rce: listening on {}:{}", bind, port);
 
+    // Warn when binding to a non-loopback address.  janus-rce carries no
+    // TLS or network-level access control of its own, so an internet-facing
+    // bind address puts the bearer token and all configured commands at risk.
+    let is_loopback = bind
+        .parse::<std::net::IpAddr>()
+        .map(|a| a.is_loopback())
+        .unwrap_or(false);
+    if !is_loopback {
+        eprintln!(
+            "janus-rce: WARNING: binding to non-loopback address '{}'; \
+             ensure network-level access controls are in place",
+            bind
+        );
+    }
+
     // Build on top of Rocket's default figment (which reads Rocket.toml and
     // ROCKET_* env vars) and overlay our own port/address.
     let figment = rocket::Config::figment()

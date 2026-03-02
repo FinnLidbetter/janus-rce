@@ -22,6 +22,7 @@
 
 use std::process::Stdio;
 
+use rocket::Shutdown;
 use rocket::response::stream::{Event, EventStream};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -87,12 +88,29 @@ enum Tagged {
 ///
 /// If the child cannot be spawned at all, a single `exit` event with
 /// `code: null` is emitted immediately.
-pub fn run_command(cmd: ValidatedCommand) -> EventStream![] {
+///
+/// The `shutdown` handle is obtained from Rocket's managed shutdown mechanism.
+/// When the server begins shutting down, the running child process is killed
+/// immediately rather than waiting for it to finish naturally.
+pub fn run_command(cmd: ValidatedCommand, mut shutdown: Shutdown) -> EventStream![] {
     EventStream! {
+        let start = std::time::Instant::now();
+        tracing::info!(
+            command = %cmd.name,
+            executable = %cmd.executable.display(),
+            argv = ?cmd.argv,
+            "command started",
+        );
+
         let mut child = match spawn_child(&cmd) {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("Failed to spawn '{}': {}", cmd.executable.display(), e);
+                tracing::error!(
+                    command = %cmd.name,
+                    executable = %cmd.executable.display(),
+                    error = %e,
+                    "failed to spawn command",
+                );
                 yield Event::json(&OutputEvent::Exit { code: None });
                 return;
             }
@@ -110,17 +128,37 @@ pub fn run_command(cmd: ValidatedCommand) -> EventStream![] {
         // Merge interleaves items as they arrive.
         let mut merged = stdout_stream.merge(stderr_stream);
 
-        while let Some(result) = merged.next().await {
-            match result {
-                Ok(Tagged::Stdout(line)) => {
-                    yield Event::json(&OutputEvent::Stdout { data: line });
+        loop {
+            tokio::select! {
+                // Check for server shutdown before the next output line so
+                // that in-flight commands are terminated promptly.
+                biased;
+                _ = &mut shutdown => {
+                    tracing::info!(
+                        command = %cmd.name,
+                        "command killed: server shutting down",
+                    );
+                    let _ = child.kill().await;
+                    return;
                 }
-                Ok(Tagged::Stderr(line)) => {
-                    yield Event::json(&OutputEvent::Stderr { data: line });
-                }
-                Err(e) => {
-                    tracing::warn!("IO error reading process output: {}", e);
-                    // Continue draining the stream; don't abort on a single bad line.
+                result = merged.next() => {
+                    match result {
+                        Some(Ok(Tagged::Stdout(line))) => {
+                            yield Event::json(&OutputEvent::Stdout { data: line });
+                        }
+                        Some(Ok(Tagged::Stderr(line))) => {
+                            yield Event::json(&OutputEvent::Stderr { data: line });
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                command = %cmd.name,
+                                error = %e,
+                                "IO error reading process output",
+                            );
+                            // Continue draining; don't abort on a single bad line.
+                        }
+                        None => break,
+                    }
                 }
             }
         }
@@ -129,10 +167,21 @@ pub fn run_command(cmd: ValidatedCommand) -> EventStream![] {
         let exit_code = match child.wait().await {
             Ok(status) => status.code(),
             Err(e) => {
-                tracing::error!("Error waiting for child process: {}", e);
+                tracing::error!(
+                    command = %cmd.name,
+                    error = %e,
+                    "error waiting for child process",
+                );
                 None
             }
         };
+
+        tracing::info!(
+            command = %cmd.name,
+            exit_code = ?exit_code,
+            duration_ms = start.elapsed().as_millis(),
+            "command finished",
+        );
 
         yield Event::json(&OutputEvent::Exit { code: exit_code });
     }
@@ -148,6 +197,10 @@ pub fn run_command(cmd: ValidatedCommand) -> EventStream![] {
 /// returned by `safe_env`.  `kill_on_drop(true)` is set so that the child
 /// is terminated if the returned [`Child`] handle is dropped.
 ///
+/// On Unix, the child is placed in its own process group (`process_group(0)`)
+/// so that terminal signals such as `SIGINT` and `SIGQUIT` sent to the
+/// server's process group are not automatically forwarded to child processes.
+///
 /// [`Child`]: tokio::process::Child
 fn spawn_child(cmd: &ValidatedCommand) -> std::io::Result<tokio::process::Child> {
     let working_dir = cmd
@@ -155,7 +208,8 @@ fn spawn_child(cmd: &ValidatedCommand) -> std::io::Result<tokio::process::Child>
         .as_deref()
         .unwrap_or_else(|| std::path::Path::new("/"));
 
-    Command::new(&cmd.executable)
+    let mut command = Command::new(&cmd.executable);
+    command
         .args(&cmd.argv)
         .current_dir(working_dir)
         .stdout(Stdio::piped())
@@ -165,8 +219,14 @@ fn spawn_child(cmd: &ValidatedCommand) -> std::io::Result<tokio::process::Child>
         .env_clear()
         .envs(safe_env())
         // Kill the child if the Rocket handler is dropped (e.g. client disconnects).
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+
+    // Isolate the child in its own process group so terminal signals sent to
+    // the server's group are not automatically forwarded to child processes.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    command.spawn()
 }
 
 /// Returns a minimal, safe set of environment variables for child processes.

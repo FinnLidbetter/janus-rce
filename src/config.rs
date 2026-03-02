@@ -313,6 +313,15 @@ impl LoadedCommandSpec {
         // unused-variable warning on non-unix platforms.
         let _ = meta;
 
+        // Verify that working_dir exists and is a directory.
+        if let Some(dir) = &spec.working_dir {
+            let dir_meta = std::fs::metadata(dir)
+                .with_context(|| format!("stat working_dir '{}'", dir.display()))?;
+            if !dir_meta.is_dir() {
+                bail!("working_dir '{}' is not a directory", dir.display());
+            }
+        }
+
         let mut args = Vec::with_capacity(spec.args.len());
         for arg in &spec.args {
             args.push(LoadedArgSpec::validate(arg).with_context(|| format!("arg '{}'", arg.name))?);
@@ -383,7 +392,9 @@ fn enforce_anchoring(pattern: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::enforce_anchoring;
+    use std::path::PathBuf;
+
+    use super::{CommandSpec, LoadedCommandSpec, enforce_anchoring};
 
     #[test]
     fn anchoring_adds_both() {
@@ -403,5 +414,52 @@ mod tests {
     #[test]
     fn anchoring_adds_missing_start() {
         assert_eq!(enforce_anchoring("foo$"), "^foo$");
+    }
+
+    // ------------------------------------------------------------------
+    // working_dir validation
+    // ------------------------------------------------------------------
+
+    fn minimal_spec(working_dir: Option<PathBuf>) -> CommandSpec {
+        CommandSpec {
+            name: "cmd".into(),
+            executable: PathBuf::from("/usr/bin/true"),
+            working_dir,
+            args: vec![],
+        }
+    }
+
+    #[test]
+    fn working_dir_absent_is_ok() {
+        assert!(LoadedCommandSpec::validate(&minimal_spec(None)).is_ok());
+    }
+
+    #[test]
+    fn working_dir_valid_dir_is_ok() {
+        assert!(LoadedCommandSpec::validate(&minimal_spec(Some(PathBuf::from("/tmp")))).is_ok());
+    }
+
+    #[test]
+    fn working_dir_nonexistent_rejected() {
+        let result = LoadedCommandSpec::validate(&minimal_spec(Some(PathBuf::from(
+            "/tmp/janus_no_such_working_dir_xyz_abc_123",
+        ))));
+        assert!(
+            result.is_err(),
+            "expected error for nonexistent working_dir"
+        );
+    }
+
+    #[test]
+    fn working_dir_file_rejected() {
+        // /etc/hosts exists on both Linux and macOS and is a regular file.
+        let result = LoadedCommandSpec::validate(&minimal_spec(Some(PathBuf::from("/etc/hosts"))));
+        match result {
+            Ok(_) => panic!("expected error when working_dir is a file, got Ok"),
+            Err(e) => assert!(
+                e.to_string().contains("not a directory"),
+                "error should mention 'not a directory': {e}"
+            ),
+        }
     }
 }

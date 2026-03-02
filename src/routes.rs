@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use rocket::http::Status;
 use rocket::response::stream::EventStream;
 use rocket::serde::json::Json;
-use rocket::{State, catch, get, post};
+use rocket::{Shutdown, State, catch, get, post};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthToken;
@@ -145,6 +145,7 @@ pub fn run(
     _auth: AuthToken,
     request: Json<RunRequest>,
     config: &State<LoadedConfig>,
+    shutdown: Shutdown,
 ) -> Result<EventStream![], (Status, Json<ErrorBody>)> {
     let validated = match validate::validate(&request, config) {
         Ok(v) => v,
@@ -182,7 +183,7 @@ pub fn run(
         }
     };
 
-    Ok(executor::run_command(validated))
+    Ok(executor::run_command(validated, shutdown))
 }
 
 // ---------------------------------------------------------------------------

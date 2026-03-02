@@ -228,3 +228,73 @@ async fn run_fail_exits_nonzero() {
     assert_eq!(last["type"], "exit");
     assert_eq!(last["code"], 1);
 }
+
+// ---------------------------------------------------------------------------
+// Shutdown — child killed promptly when server shuts down
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn run_killed_on_shutdown() {
+    use std::time::Duration;
+
+    // /usr/bin/yes outputs "y\n" forever; it will only stop when killed.
+    let config = LoadedConfig {
+        server: ServerConfig {
+            port: 0,
+            bind: "127.0.0.1".into(),
+            token: None,
+        },
+        token: TEST_TOKEN.into(),
+        commands: vec![LoadedCommandSpec {
+            name: "yes".into(),
+            executable: PathBuf::from("/usr/bin/yes"),
+            working_dir: None,
+            args: vec![],
+        }],
+    };
+    let client = Client::tracked(janus_rce::build_rocket(rocket::Config::figment(), config))
+        .await
+        .expect("valid rocket instance");
+
+    // Clone the Shutdown handle before dispatching so we can notify from a
+    // concurrent task while the main task is blocked draining the SSE stream.
+    let shutdown = client.rocket().shutdown().clone();
+    tokio::spawn(async move {
+        // Give the child process a moment to start producing output.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.notify();
+    });
+
+    // Dispatch the request.  The stream will block until the child is killed.
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post("/run")
+            .header(ContentType::JSON)
+            .header(auth_header(TEST_TOKEN))
+            .body(r#"{"command":"yes"}"#)
+            .dispatch(),
+    )
+    .await
+    .expect("dispatch completed within timeout");
+
+    assert_eq!(response.status(), Status::Ok);
+
+    let raw = tokio::time::timeout(Duration::from_secs(5), response.into_string())
+        .await
+        .expect("body drained within timeout")
+        .unwrap_or_default();
+
+    let events = parse_sse(&raw);
+
+    // run_command returns without yielding an Exit event when killed by shutdown.
+    assert!(
+        !events.iter().any(|e| e["type"] == "exit"),
+        "expected no exit event when killed by shutdown, got: {events:?}",
+    );
+    // At least one stdout line should have been received before shutdown.
+    assert!(
+        events.iter().any(|e| e["type"] == "stdout"),
+        "expected stdout events from yes(1) before shutdown, got: {events:?}",
+    );
+}

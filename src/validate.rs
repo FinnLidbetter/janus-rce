@@ -29,6 +29,8 @@ use crate::routes::RunRequest;
 /// needed before spawning.
 #[derive(Debug)]
 pub struct ValidatedCommand {
+    /// Config name of the command (used in audit logs).
+    pub name: String,
     /// Absolute path to the executable.
     pub executable: PathBuf,
     /// Working directory for the child process, or `None` to use `/`.
@@ -271,6 +273,7 @@ pub fn validate(
     }
 
     Ok(ValidatedCommand {
+        name: spec.name.clone(),
         executable: spec.executable.clone(),
         working_dir: spec.working_dir.clone(),
         argv,
@@ -588,6 +591,7 @@ mod tests {
     fn executable_and_workdir_passthrough() {
         let config = test_config();
         let result = validate(&req("greet", vec![("format", json!("text"))]), &config).unwrap();
+        assert_eq!(result.name, "greet");
         assert_eq!(result.executable, PathBuf::from("/usr/bin/true"));
         assert!(result.working_dir.is_none());
     }
