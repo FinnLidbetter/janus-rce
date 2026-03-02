@@ -1,3 +1,18 @@
+//! Per-request validation of [`RunRequest`]s against the loaded configuration.
+//!
+//! The entry point is [`validate`], which performs four checks in order:
+//!
+//! 1. **Command lookup** — the requested command name must exist in the config.
+//! 2. **Unknown args** — every key in the request must be declared in the
+//!    command's argument list.
+//! 3. **Required args** — every required argument must be present.
+//! 4. **Value validation** — each argument value is checked for shell
+//!    metacharacters and then validated against its declared type (`enum`,
+//!    `pattern`, `path`, or `bool`).
+//!
+//! On success, [`validate`] returns a [`ValidatedCommand`] that the executor
+//! can spawn directly without further checking.
+
 use std::path::PathBuf;
 
 use crate::config::{LoadedArgType, LoadedConfig};
@@ -7,21 +22,41 @@ use crate::routes::RunRequest;
 // Output types
 // ---------------------------------------------------------------------------
 
-/// A fully-validated command ready to hand to the executor.
-/// `argv` is a flat, ordered list of CLI arguments with no shell interpretation.
+/// A fully-validated command ready to pass to the executor.
+///
+/// All values have been type-checked, screened for shell metacharacters, and
+/// ordered according to the config declaration.  No further validation is
+/// needed before spawning.
 #[derive(Debug)]
 pub struct ValidatedCommand {
+    /// Absolute path to the executable.
     pub executable: PathBuf,
+    /// Working directory for the child process, or `None` to use `/`.
     pub working_dir: Option<PathBuf>,
+    /// Flat, ordered list of CLI arguments with no shell interpretation.
+    /// Flags and their values appear in config declaration order.
     pub argv: Vec<String>,
 }
 
+/// Errors that [`validate`] can return.
 #[derive(Debug)]
 pub enum ValidationError {
+    /// The requested command name was not found in the config.
     CommandNotFound,
+    /// The request contained argument keys not declared in the config.
+    /// The inner `Vec` lists the unknown names.
     UnknownArgs(Vec<String>),
+    /// One or more required arguments were absent from the request.
+    /// The inner `Vec` lists the missing names.
     MissingRequiredArgs(Vec<String>),
-    InvalidArgValue { arg: String, reason: String },
+    /// An argument value failed type validation or the shell metacharacter
+    /// check.
+    InvalidArgValue {
+        /// Name of the offending argument.
+        arg: String,
+        /// Human-readable explanation of why the value was rejected.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -33,7 +68,7 @@ pub enum ValidationError {
 ///
 /// Although arguments are passed to child processes via `Command::args()` (no
 /// shell involved), child programs may themselves invoke a shell or call
-/// `system(3)`. Rejecting metacharacters here provides defence-in-depth and
+/// `system(3)`.  Rejecting metacharacters here provides defence-in-depth and
 /// keeps all validated values safe for display, logging, and any downstream
 /// shell invocation a child might make.
 fn reject_shell_metacharacters(arg: &str, value: &str) -> Result<(), ValidationError> {
@@ -63,6 +98,49 @@ fn reject_shell_metacharacters(arg: &str, value: &str) -> Result<(), ValidationE
 // Validation
 // ---------------------------------------------------------------------------
 
+/// Validates a [`RunRequest`] against `config` and returns a
+/// [`ValidatedCommand`] ready for the executor.
+///
+/// Validation is performed in four sequential steps; the first failure short-
+/// circuits the rest.  See the [module documentation](self) for details.
+///
+/// # Errors
+///
+/// * [`ValidationError::CommandNotFound`] — unknown command name.
+/// * [`ValidationError::UnknownArgs`] — request keys not in the command spec.
+/// * [`ValidationError::MissingRequiredArgs`] — required keys absent from
+///   request.
+/// * [`ValidationError::InvalidArgValue`] — a value contained a shell
+///   metacharacter or failed its type check.
+///
+/// # Examples
+///
+/// ```
+/// use janus_rce::config::{LoadedCommandSpec, LoadedConfig, ServerConfig};
+/// use janus_rce::routes::RunRequest;
+/// use janus_rce::validate::{self, ValidationError};
+/// use std::collections::HashMap;
+/// use std::path::PathBuf;
+///
+/// let config = LoadedConfig {
+///     server: ServerConfig { port: 8080, bind: "127.0.0.1".into(), token: None },
+///     token: "secret".into(),
+///     commands: vec![LoadedCommandSpec {
+///         name: "ping".into(),
+///         executable: PathBuf::from("/usr/bin/true"),
+///         working_dir: None,
+///         args: vec![],
+///     }],
+/// };
+///
+/// // Valid request.
+/// let ok = RunRequest { command: "ping".into(), args: HashMap::new() };
+/// assert!(validate::validate(&ok, &config).is_ok());
+///
+/// // Unknown command.
+/// let bad = RunRequest { command: "rm".into(), args: HashMap::new() };
+/// assert!(matches!(validate::validate(&bad, &config), Err(ValidationError::CommandNotFound)));
+/// ```
 pub fn validate(
     request: &RunRequest,
     config: &LoadedConfig,

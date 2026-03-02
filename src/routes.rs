@@ -1,3 +1,25 @@
+//! Rocket route handlers and HTTP request/response types.
+//!
+//! # Routes
+//!
+//! | Method | Path | Auth | Description |
+//! |--------|------|------|-------------|
+//! | `GET`  | `/health` | No | Liveness check |
+//! | `GET`  | `/commands` | Yes | List available commands and their arguments |
+//! | `POST` | `/run` | Yes | Validate and execute a command; stream output as SSE |
+//!
+//! All authenticated routes require an `Authorization: Bearer <token>` header.
+//! Missing or invalid tokens result in a `401 Unauthorized` JSON response.
+//!
+//! # Error responses
+//!
+//! All error responses (including Rocket's built-in catchers) use the same
+//! JSON envelope:
+//!
+//! ```json
+//! {"error": "<human-readable message>"}
+//! ```
+
 use std::collections::HashMap;
 
 use rocket::http::Status;
@@ -15,35 +37,51 @@ use crate::validate::{self, ValidationError};
 // Request / response types
 // ---------------------------------------------------------------------------
 
+/// Request body for `POST /run`.
 #[derive(Debug, Deserialize)]
 pub struct RunRequest {
+    /// Name of the command to execute, as declared in the config.
     pub command: String,
+    /// Argument values keyed by argument name.  Unknown keys and missing
+    /// required keys are rejected by the validator.  Absent optional keys are
+    /// simply omitted from `argv`.
     #[serde(default)]
     pub args: HashMap<String, serde_json::Value>,
 }
 
+/// Common error envelope returned by all error responses.
 #[derive(Serialize)]
 pub struct ErrorBody {
+    /// Human-readable description of the error.
     pub error: String,
 }
 
+/// Response body for `GET /health`.
 #[derive(Serialize)]
 pub struct HealthResponse {
     status: &'static str,
 }
 
-/// Describes one command as seen by the caller — no executable paths or
-/// working directories are included.
+/// Describes one command as seen by the caller.
+///
+/// Intentionally omits the executable path and working directory — those are
+/// server-side implementation details that callers have no need to see.
 #[derive(Serialize)]
 pub struct CommandInfo {
+    /// Command name used in `POST /run` requests.
     pub name: String,
+    /// Declared arguments in config order.
     pub args: Vec<ArgInfo>,
 }
 
+/// Describes one argument as seen by the caller.
 #[derive(Serialize)]
 pub struct ArgInfo {
+    /// Argument name used in the `args` map of a `POST /run` request.
     pub name: String,
+    /// Whether the argument must be supplied.
     pub required: bool,
+    /// Validation type: `"enum"`, `"pattern"`, `"path"`, or `"bool"`.
     #[serde(rename = "type")]
     pub arg_type: &'static str,
 }
@@ -53,13 +91,18 @@ pub struct ArgInfo {
 // ---------------------------------------------------------------------------
 
 /// `GET /health` — liveness check, no authentication required.
+///
+/// Returns `200 OK` with `{"status":"ok"}`.  Intended for health checks and
+/// load-balancer probes.
 #[get("/health")]
 pub fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-/// `GET /commands` — list allowed commands and their declared args.
-/// Requires a valid bearer token.
+/// `GET /commands` — list the commands available to authenticated callers.
+///
+/// Returns a JSON array of [`CommandInfo`] objects, one per configured command,
+/// in config file order.  Requires a valid bearer token.
 #[get("/commands")]
 pub fn commands(_auth: AuthToken, config: &State<LoadedConfig>) -> Json<Vec<CommandInfo>> {
     let infos = config
@@ -82,7 +125,21 @@ pub fn commands(_auth: AuthToken, config: &State<LoadedConfig>) -> Json<Vec<Comm
 }
 
 /// `POST /run` — validate and execute a command, streaming output as SSE.
-/// Requires a valid bearer token.
+///
+/// The request body must be `Content-Type: application/json` and deserialise
+/// as a [`RunRequest`].  Requires a valid bearer token.
+///
+/// On success, responds with `200 OK` and a `text/event-stream` body.  Each
+/// event's `data` field is a JSON object; see [`crate::executor::OutputEvent`]
+/// for the schema.
+///
+/// # Error responses
+///
+/// | Status | Condition |
+/// |--------|-----------|
+/// | `401`  | Missing or invalid bearer token |
+/// | `404`  | Command name not found in config |
+/// | `422`  | Unknown args, missing required args, or invalid arg value |
 #[post("/run", format = "json", data = "<request>")]
 pub fn run(
     _auth: AuthToken,
@@ -132,7 +189,7 @@ pub fn run(
 // Error catchers
 // ---------------------------------------------------------------------------
 
-/// Return JSON for 401 Unauthorized instead of Rocket's default HTML page.
+/// Returns a JSON `401 Unauthorized` body instead of Rocket's default HTML.
 #[catch(401)]
 pub fn unauthorized() -> Json<ErrorBody> {
     Json(ErrorBody {
@@ -140,7 +197,7 @@ pub fn unauthorized() -> Json<ErrorBody> {
     })
 }
 
-/// Return JSON for 404 Not Found instead of Rocket's default HTML page.
+/// Returns a JSON `404 Not Found` body instead of Rocket's default HTML.
 #[catch(404)]
 pub fn not_found() -> Json<ErrorBody> {
     Json(ErrorBody {
@@ -148,7 +205,9 @@ pub fn not_found() -> Json<ErrorBody> {
     })
 }
 
-/// Return JSON for 422 Unprocessable Entity (e.g. malformed request body).
+/// Returns a JSON `422 Unprocessable Entity` body instead of Rocket's default
+/// HTML.  Triggered when the request body is malformed or has the wrong
+/// `Content-Type`.
 #[catch(422)]
 pub fn unprocessable() -> Json<ErrorBody> {
     Json(ErrorBody {
@@ -156,7 +215,8 @@ pub fn unprocessable() -> Json<ErrorBody> {
     })
 }
 
-/// Return JSON for 500 Internal Server Error.
+/// Returns a JSON `500 Internal Server Error` body instead of Rocket's default
+/// HTML.
 #[catch(500)]
 pub fn internal_error() -> Json<ErrorBody> {
     Json(ErrorBody {

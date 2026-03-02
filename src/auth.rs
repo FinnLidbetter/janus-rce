@@ -1,17 +1,37 @@
+//! Bearer-token authentication for Rocket route handlers.
+//!
+//! [`AuthToken`] is a zero-sized Rocket [request guard].  Adding it as a
+//! parameter to a route handler requires the caller to supply a valid
+//! `Authorization: Bearer <token>` header; Rocket returns `401 Unauthorized`
+//! automatically when the guard fails.
+//!
+//! Token comparison is performed in constant time via [`subtle::ConstantTimeEq`]
+//! to avoid leaking information through response-timing differences.
+//!
+//! [request guard]: https://rocket.rs/guide/requests/#request-guards
+
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
 use subtle::ConstantTimeEq;
 
 use crate::config::LoadedConfig;
 
-/// Zero-sized marker type. Its presence as a route parameter means the request
-/// carried a valid bearer token.
+/// Zero-sized marker type that acts as a Rocket request guard.
+///
+/// Its presence as a route parameter signals that the request carried a valid
+/// `Authorization: Bearer <token>` header matching the configured token.
+/// Routes that require authentication simply declare `_auth: AuthToken` in
+/// their parameter list.
 pub struct AuthToken;
 
+/// Failure modes for the [`AuthToken`] request guard.
 #[derive(Debug)]
 pub enum AuthError {
+    /// No `Authorization` header was present.
     Missing,
+    /// An `Authorization` header was present but did not start with `"Bearer "`.
     Malformed,
+    /// The bearer token did not match the configured value.
     Invalid,
 }
 
@@ -43,13 +63,13 @@ impl<'r> FromRequest<'r> for AuthToken {
 
 /// Constant-time byte-slice equality.
 ///
-/// `subtle::ConstantTimeEq` for slices only guarantees constant time when both
-/// slices have the same length. When lengths differ the comparison definitively
-/// returns `false`, but the length check itself is a potential timing side
-/// channel. We mitigate this by always running a constant-time comparison of
-/// `provided` against itself (a no-op) when lengths differ, keeping the branch
-/// behaviour as uniform as possible for an attacker measuring response time on
-/// a loopback interface.
+/// [`subtle::ConstantTimeEq`] for slices only guarantees constant time when
+/// both slices have the same length.  When lengths differ the comparison
+/// definitively returns `false`, but the length check itself is a potential
+/// timing side channel.  We mitigate this by always running a constant-time
+/// comparison of `provided` against itself (a no-op) when lengths differ,
+/// keeping the branch behaviour as uniform as possible for an attacker
+/// measuring response time on a loopback interface.
 fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
     let lengths_match = expected.len() == provided.len();
 
