@@ -19,6 +19,9 @@ and testing an Xcode project — without giving the agent a general-purpose shel
   canonical path within an allowed directory, or a boolean flag.  Shell
   metacharacters are rejected in all string arguments as an additional
   defence-in-depth layer.
+- **Fixed arguments.** Server-side positional words (`fixed_args`) are declared in
+  the config and always prepended to `argv` before any user-supplied arguments.
+  They are never user-controlled and cannot be overridden at request time.
 - **No shell.** Commands are spawned via `Command::args()` — arguments are passed
   directly to `execve`; no shell is involved.
 - **Environment isolation.** Child processes start with a cleared environment
@@ -78,14 +81,20 @@ working_dir = "/path/to/MyApp" # optional; defaults to /
 Arguments are declared in the order they will be appended to `argv`.  Four
 validation types are supported:
 
-| Type | TOML | Description |
-|------|------|-------------|
-| `enum` | `type = "enum"; values = ["a", "b"]` | Value must be one of the listed strings |
-| `pattern` | `type = "pattern"; pattern = "[a-z]+"` | Value must match the regex (auto-anchored `^…$`) |
-| `path` | `type = "path"; within = ["/tmp"]` | Value must be an absolute path within one of the listed directories |
-| `bool` | `type = "bool"` | `true` appends the flag; `false` omits it |
+| Type | TOML | `flag` field | Description |
+|------|------|--------------|-------------|
+| `enum` | `type = "enum"; values = ["a", "b"]` | Required | Value must be one of the listed strings; appended as `[flag, value]` |
+| `pattern` | `type = "pattern"; pattern = "[a-z]+"` | Required | Value must match the regex (auto-anchored `^…$`); appended as `[flag, value]` |
+| `path` | `type = "path"; within = ["/tmp"]` | Required | Value must be an absolute path within one of the listed directories; appended as `[flag, value]` |
+| `bool` | `type = "bool"` | Required | `true` appends the flag alone; `false` omits it entirely |
 
 ```toml
+[[commands]]
+name       = "build"
+executable = "/usr/bin/xcodebuild"
+# Server-side positional words always prepended to argv (not user-controlled).
+fixed_args = ["build"]
+
 [[commands.args]]
 name     = "scheme"
 flag     = "-scheme"

@@ -68,6 +68,10 @@ pub struct CommandSpec {
     /// Declared arguments, in the order they will be appended to `argv`.
     #[serde(default)]
     pub args: Vec<ArgSpec>,
+    /// Server-side positional words prepended to `argv` before any
+    /// user-supplied arguments.  Not user-controlled.
+    #[serde(default)]
+    pub fixed_args: Vec<String>,
 }
 
 /// Raw argument specification within a `[[commands]]` entry.
@@ -76,6 +80,7 @@ pub struct ArgSpec {
     /// Argument name used in the JSON request body.
     pub name: String,
     /// CLI flag passed to the executable (e.g. `"--output"`).
+    #[serde(default)]
     pub flag: String,
     /// Whether the caller must supply this argument.  Defaults to `false`.
     #[serde(default)]
@@ -88,16 +93,18 @@ pub struct ArgSpec {
 /// Validation rule for a single argument, tagged by `type` in TOML.
 ///
 /// ```toml
-/// # Enum — value must be one of the listed strings.
+/// # Enum — value must be one of the listed strings; appended as [flag, value].
 /// { type = "enum", values = ["text", "json"] }
 ///
-/// # Pattern — value must match the regex.
+/// # Pattern — value must match the regex; appended as [flag, value].
 /// { type = "pattern", pattern = "[a-zA-Z]+" }
 ///
-/// # Path — value must be an absolute path within the listed directories.
+/// # Path — value must be an absolute path within the listed directories;
+/// #        appended as [flag, value].
 /// { type = "path", within = ["/tmp"] }
 ///
-/// # Bool — value must be a JSON boolean; true appends the flag, false omits it.
+/// # Bool — value must be a JSON boolean; true appends the flag alone, false
+/// #        omits it entirely.
 /// { type = "bool" }
 /// ```
 #[derive(Debug, Deserialize, Clone)]
@@ -143,13 +150,17 @@ pub struct LoadedCommandSpec {
     pub working_dir: Option<PathBuf>,
     /// Validated argument specifications in declaration order.
     pub args: Vec<LoadedArgSpec>,
+    /// Server-side positional words prepended to `argv` before any
+    /// user-supplied arguments.  Not user-controlled.
+    pub fixed_args: Vec<String>,
 }
 
 /// A validated argument specification with pre-compiled validation data.
 pub struct LoadedArgSpec {
     /// Argument name as it appears in JSON requests.
     pub name: String,
-    /// CLI flag appended to `argv` when the argument is present.
+    /// CLI flag appended to `argv` before the value (e.g. `"--output"`).
+    /// Not used for `bool`-type arguments where the flag is appended directly.
     pub flag: String,
     /// Whether the argument must be supplied by the caller.
     pub required: bool,
@@ -273,6 +284,7 @@ impl LoadedConfig {
     ///         executable: PathBuf::from("/usr/bin/true"),
     ///         working_dir: None,
     ///         args: vec![],
+    ///         fixed_args: vec![],
     ///     }],
     /// };
     ///
@@ -327,11 +339,21 @@ impl LoadedCommandSpec {
             args.push(LoadedArgSpec::validate(arg).with_context(|| format!("arg '{}'", arg.name))?);
         }
 
+        for (i, fixed) in spec.fixed_args.iter().enumerate() {
+            if fixed.is_empty() {
+                bail!("fixed_args[{}] must not be an empty string", i);
+            }
+            if fixed.contains('\0') {
+                bail!("fixed_args[{}] must not contain a null byte", i);
+            }
+        }
+
         Ok(LoadedCommandSpec {
             name: spec.name.clone(),
             executable: spec.executable.clone(),
             working_dir: spec.working_dir.clone(),
             args,
+            fixed_args: spec.fixed_args.clone(),
         })
     }
 }
@@ -426,6 +448,7 @@ mod tests {
             executable: PathBuf::from("/usr/bin/true"),
             working_dir,
             args: vec![],
+            fixed_args: vec![],
         }
     }
 

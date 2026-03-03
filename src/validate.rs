@@ -132,6 +132,7 @@ fn reject_shell_metacharacters(arg: &str, value: &str) -> Result<(), ValidationE
 ///         executable: PathBuf::from("/usr/bin/true"),
 ///         working_dir: None,
 ///         args: vec![],
+///         fixed_args: vec![],
 ///     }],
 /// };
 ///
@@ -177,7 +178,8 @@ pub fn validate(
     }
 
     // 4. Validate each arg value and build the argv list in config declaration order.
-    let mut argv: Vec<String> = Vec::new();
+    //    fixed_args are always prepended unconditionally.
+    let mut argv: Vec<String> = spec.fixed_args.clone();
 
     for arg_spec in &spec.args {
         let raw_value = match request.args.get(&arg_spec.name) {
@@ -339,6 +341,7 @@ mod tests {
                         },
                     },
                 ],
+                fixed_args: vec!["--greet".into()],
             }],
         }
     }
@@ -388,7 +391,8 @@ mod tests {
     fn enum_valid() {
         let config = test_config();
         let result = validate(&req("greet", vec![("format", json!("text"))]), &config).unwrap();
-        assert_eq!(result.argv, vec!["--format", "text"]);
+        // fixed_args = ["--greet"] is prepended; user args follow.
+        assert_eq!(result.argv, vec!["--greet", "--format", "text"]);
     }
 
     #[test]
@@ -683,5 +687,29 @@ mod tests {
         // Plain alphanumeric + hyphen/dot values must not be rejected.
         let config = test_config();
         assert!(validate(&req("greet", vec![("format", json!("text"))]), &config).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // fixed_args tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fixed_args_prepended_to_argv() {
+        // test_config() sets fixed_args = ["--greet"] on the "greet" command.
+        // fixed_args must appear before user-supplied args in argv.
+        let config = test_config();
+        let result = validate(&req("greet", vec![("format", json!("text"))]), &config).unwrap();
+        let argv = &result.argv;
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("--greet"),
+            "fixed_args must be prepended to argv"
+        );
+        let fixed_pos = argv.iter().position(|x| x == "--greet").unwrap();
+        let flag_pos = argv.iter().position(|x| x == "--format").unwrap();
+        assert!(
+            fixed_pos < flag_pos,
+            "fixed_args must appear before user-supplied args"
+        );
     }
 }

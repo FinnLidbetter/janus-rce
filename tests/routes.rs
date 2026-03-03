@@ -24,12 +24,14 @@ fn test_config() -> LoadedConfig {
                 executable: PathBuf::from("/usr/bin/true"),
                 working_dir: None,
                 args: vec![],
+                fixed_args: vec![],
             },
             LoadedCommandSpec {
                 name: "fail".into(),
                 executable: PathBuf::from("/usr/bin/false"),
                 working_dir: None,
                 args: vec![],
+                fixed_args: vec![],
             },
             LoadedCommandSpec {
                 name: "greet".into(),
@@ -43,6 +45,7 @@ fn test_config() -> LoadedConfig {
                         values: vec!["text".into(), "json".into()],
                     },
                 }],
+                fixed_args: vec![],
             },
         ],
     }
@@ -250,6 +253,7 @@ async fn run_killed_on_shutdown() {
             executable: PathBuf::from("/usr/bin/yes"),
             working_dir: None,
             args: vec![],
+            fixed_args: vec![],
         }],
     };
     let client = Client::tracked(janus_rce::build_rocket(rocket::Config::figment(), config))
