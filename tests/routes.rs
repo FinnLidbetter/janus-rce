@@ -233,6 +233,180 @@ async fn run_fail_exits_nonzero() {
 }
 
 // ---------------------------------------------------------------------------
+// /commands — argument structure
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn commands_response_arg_structure() {
+    let client = test_client().await;
+    let response = client
+        .get("/commands")
+        .header(auth_header(TEST_TOKEN))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let body: Vec<Value> = serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+
+    // The "greet" command declares one required enum arg called "format".
+    let greet = body
+        .iter()
+        .find(|c| c["name"] == "greet")
+        .expect("greet command should appear in /commands response");
+    let args = greet["args"].as_array().expect("args must be a JSON array");
+    assert_eq!(args.len(), 1, "greet has exactly one arg");
+    assert_eq!(args[0]["name"], "format");
+    assert_eq!(args[0]["required"], true);
+    assert_eq!(args[0]["type"], "enum");
+}
+
+// ---------------------------------------------------------------------------
+// /run — additional auth and request-shape error cases
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn run_authorization_wrong_scheme() {
+    // "Basic" scheme must be rejected the same as a missing header (401).
+    let client = test_client().await;
+    let response = client
+        .post("/run")
+        .header(ContentType::JSON)
+        .header(Header::new("Authorization", "Basic dXNlcjpwYXNz"))
+        .body(r#"{"command":"succeed"}"#)
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Unauthorized);
+}
+
+#[rocket::async_test]
+async fn run_malformed_json_body() {
+    // Syntactically invalid JSON triggers Rocket's data-guard failure at the
+    // parse level, which yields 400 Bad Request (not 422).
+    let client = test_client().await;
+    let response = client
+        .post("/run")
+        .header(ContentType::JSON)
+        .header(auth_header(TEST_TOKEN))
+        .body("{not valid json")
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::BadRequest);
+}
+
+#[rocket::async_test]
+async fn run_missing_command_field() {
+    // Valid JSON that omits the required "command" field must return 422.
+    let client = test_client().await;
+    let response = client
+        .post("/run")
+        .header(ContentType::JSON)
+        .header(auth_header(TEST_TOKEN))
+        .body(r#"{"args": {}}"#)
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::UnprocessableEntity);
+}
+
+// ---------------------------------------------------------------------------
+// Unknown route → 404 JSON envelope
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn get_unknown_route() {
+    let client = test_client().await;
+    let response = client.get("/nonexistent").dispatch().await;
+    assert_eq!(response.status(), Status::NotFound);
+    // The 404 catcher must return a JSON body with an "error" key.
+    let body: Value = serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+    assert!(
+        body["error"].is_string(),
+        "expected JSON error envelope, got: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// /run — SSE Content-Type
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn run_sse_content_type() {
+    let client = test_client().await;
+    let response = client
+        .post("/run")
+        .header(ContentType::JSON)
+        .header(auth_header(TEST_TOKEN))
+        .body(r#"{"command":"succeed"}"#)
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let ct = response
+        .headers()
+        .get_one("Content-Type")
+        .expect("response must have a Content-Type header");
+    assert!(
+        ct.contains("text/event-stream"),
+        "expected text/event-stream, got: {ct}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Environment isolation — child receives only the safe variable allow-list
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn env_isolation_strips_parent_environment() {
+    use std::collections::HashSet;
+
+    // /usr/bin/env prints each environment variable on its own line as KEY=VALUE.
+    let config = LoadedConfig {
+        server: ServerConfig {
+            port: 0,
+            bind: "127.0.0.1".into(),
+            token: None,
+        },
+        token: TEST_TOKEN.into(),
+        commands: vec![LoadedCommandSpec {
+            name: "env".into(),
+            executable: PathBuf::from("/usr/bin/env"),
+            working_dir: None,
+            args: vec![],
+            fixed_args: vec![],
+        }],
+    };
+    let client = Client::tracked(janus_rce::build_rocket(rocket::Config::figment(), config))
+        .await
+        .expect("valid rocket instance");
+
+    let response = client
+        .post("/run")
+        .header(ContentType::JSON)
+        .header(auth_header(TEST_TOKEN))
+        .body(r#"{"command":"env"}"#)
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let raw = response.into_string().await.unwrap();
+    let events = parse_sse(&raw);
+
+    // Collect every environment-variable key emitted by the child.
+    let safe_keys: HashSet<&str> = ["PATH", "LANG", "HOME", "USER", "TMPDIR", "DEVELOPER_DIR"]
+        .iter()
+        .copied()
+        .collect();
+
+    for event in &events {
+        if event["type"] == "stdout" {
+            let line = event["data"].as_str().unwrap_or("");
+            if let Some(key) = line.split('=').next() {
+                assert!(
+                    safe_keys.contains(key),
+                    "unexpected env var in child process: {key:?} (from line {line:?})"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shutdown — child killed promptly when server shuts down
 // ---------------------------------------------------------------------------
 

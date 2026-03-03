@@ -159,8 +159,12 @@ pub struct LoadedCommandSpec {
 pub struct LoadedArgSpec {
     /// Argument name as it appears in JSON requests.
     pub name: String,
-    /// CLI flag appended to `argv` before the value (e.g. `"--output"`).
-    /// Not used for `bool`-type arguments where the flag is appended directly.
+    /// CLI flag appended to `argv` (e.g. `"--output"`).
+    ///
+    /// For `enum`, `pattern`, and `path` arguments the flag is followed by the
+    /// value: `["--output", "/tmp/result"]`.  For `bool` arguments the flag is
+    /// appended alone (no separate value) when the JSON value is `true`, and
+    /// omitted entirely when `false`.
     pub flag: String,
     /// Whether the argument must be supplied by the caller.
     pub required: bool,
@@ -226,6 +230,7 @@ impl LoadedConfig {
     ///   is not executable.
     /// * Any regex pattern fails to compile.
     /// * Any `path` argument's `within` directory does not exist.
+    /// * Any `fixed_args` entry is an empty string or contains a null byte.
     /// * Two commands share the same name.
     pub fn load(path: &Path) -> Result<Self> {
         let config: Config = Figment::new()
@@ -416,7 +421,9 @@ fn enforce_anchoring(pattern: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{CommandSpec, LoadedCommandSpec, enforce_anchoring};
+    use super::{
+        ArgSpec, ArgType, CommandSpec, LoadedArgSpec, LoadedCommandSpec, enforce_anchoring,
+    };
 
     #[test]
     fn anchoring_adds_both() {
@@ -482,6 +489,170 @@ mod tests {
             Err(e) => assert!(
                 e.to_string().contains("not a directory"),
                 "error should mention 'not a directory': {e}"
+            ),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Executable validation
+    // ------------------------------------------------------------------
+
+    fn cmd_spec(executable: PathBuf) -> CommandSpec {
+        CommandSpec {
+            name: "cmd".into(),
+            executable,
+            working_dir: None,
+            args: vec![],
+            fixed_args: vec![],
+        }
+    }
+
+    #[test]
+    fn executable_relative_path_rejected() {
+        let result = LoadedCommandSpec::validate(&cmd_spec(PathBuf::from("./relative/path")));
+        match result {
+            Ok(_) => panic!("expected error for relative executable path"),
+            Err(e) => assert!(
+                e.to_string().contains("absolute"),
+                "error should mention 'absolute': {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn executable_nonexistent_rejected() {
+        let result = LoadedCommandSpec::validate(&cmd_spec(PathBuf::from(
+            "/tmp/janus_no_such_executable_xyz_abc_123",
+        )));
+        assert!(result.is_err(), "expected error for nonexistent executable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_not_executable_rejected() {
+        // /etc/hosts exists on Linux and macOS but has no execute permission.
+        let result = LoadedCommandSpec::validate(&cmd_spec(PathBuf::from("/etc/hosts")));
+        match result {
+            Ok(_) => panic!("expected error for non-executable file, got Ok"),
+            Err(e) => assert!(
+                e.to_string().contains("execute permission"),
+                "error should mention 'execute permission': {e}"
+            ),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // fixed_args validation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fixed_args_empty_string_rejected() {
+        let mut spec = minimal_spec(None);
+        spec.fixed_args = vec!["".into()];
+        let result = LoadedCommandSpec::validate(&spec);
+        match result {
+            Ok(_) => panic!("expected error for empty fixed_arg, got Ok"),
+            Err(e) => assert!(
+                e.to_string().contains("empty string"),
+                "error should mention 'empty string': {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn fixed_args_null_byte_rejected() {
+        let mut spec = minimal_spec(None);
+        spec.fixed_args = vec!["arg\x00value".into()];
+        let result = LoadedCommandSpec::validate(&spec);
+        match result {
+            Ok(_) => panic!("expected error for null byte in fixed_arg, got Ok"),
+            Err(e) => assert!(
+                e.to_string().contains("null byte"),
+                "error should mention 'null byte': {e}"
+            ),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // LoadedArgSpec validation
+    // ------------------------------------------------------------------
+
+    fn minimal_arg_spec(arg_type: ArgType) -> ArgSpec {
+        ArgSpec {
+            name: "test_arg".into(),
+            flag: "--test".into(),
+            required: false,
+            arg_type,
+        }
+    }
+
+    #[test]
+    fn arg_spec_enum_empty_values_rejected() {
+        let result = LoadedArgSpec::validate(&minimal_arg_spec(ArgType::Enum { values: vec![] }));
+        match result {
+            Ok(_) => panic!("expected error for empty enum values, got Ok"),
+            Err(e) => assert!(
+                e.to_string().contains("at least one value"),
+                "error should mention 'at least one value': {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn arg_spec_pattern_invalid_regex_rejected() {
+        let result = LoadedArgSpec::validate(&minimal_arg_spec(ArgType::Pattern {
+            pattern: "[unclosed".into(),
+        }));
+        assert!(result.is_err(), "expected error for invalid regex pattern");
+    }
+
+    #[test]
+    fn arg_spec_path_nonexistent_within_rejected() {
+        let result = LoadedArgSpec::validate(&minimal_arg_spec(ArgType::Path {
+            within: vec![PathBuf::from("/tmp/janus_no_such_within_dir_xyz_abc_123")],
+        }));
+        assert!(
+            result.is_err(),
+            "expected error for nonexistent path within directory"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // LoadedConfig::load — duplicate command names
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn duplicate_command_names_rejected() {
+        use std::io::Write;
+
+        let path = PathBuf::from(format!(
+            "/tmp/janus_test_duplicate_commands_{}.toml",
+            std::process::id()
+        ));
+        let toml = r#"
+[server]
+port = 9876
+token = "test-token"
+
+[[commands]]
+name       = "cmd"
+executable = "/usr/bin/true"
+
+[[commands]]
+name       = "cmd"
+executable = "/usr/bin/true"
+"#;
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(toml.as_bytes()).unwrap();
+        }
+        let result = super::LoadedConfig::load(&path);
+        let _ = std::fs::remove_file(&path);
+        match result {
+            Ok(_) => panic!("expected error for duplicate command names, got Ok"),
+            Err(e) => assert!(
+                e.to_string().contains("Duplicate"),
+                "error should mention 'Duplicate': {e}"
             ),
         }
     }

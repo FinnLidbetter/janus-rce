@@ -712,4 +712,121 @@ mod tests {
             "fixed_args must appear before user-supplied args"
         );
     }
+
+    // ------------------------------------------------------------------
+    // Multiple-error aggregation tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn multiple_unknown_args_rejected() {
+        // All unknown arg names must be collected and returned together.
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![("unknown1", json!("a")), ("unknown2", json!("b"))],
+            ),
+            &config,
+        );
+        match result {
+            Err(ValidationError::UnknownArgs(mut args)) => {
+                args.sort();
+                assert_eq!(args, vec!["unknown1", "unknown2"]);
+            }
+            other => panic!("expected UnknownArgs with two entries, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multiple_missing_required_args() {
+        // All missing required arg names must be collected and returned together.
+        let config = LoadedConfig {
+            server: ServerConfig {
+                port: 8080,
+                bind: "127.0.0.1".into(),
+                token: None,
+            },
+            token: "test-token".into(),
+            commands: vec![LoadedCommandSpec {
+                name: "multi".into(),
+                executable: PathBuf::from("/usr/bin/true"),
+                working_dir: None,
+                fixed_args: vec![],
+                args: vec![
+                    LoadedArgSpec {
+                        name: "alpha".into(),
+                        flag: "--alpha".into(),
+                        required: true,
+                        arg_type: LoadedArgType::Enum {
+                            values: vec!["a".into()],
+                        },
+                    },
+                    LoadedArgSpec {
+                        name: "beta".into(),
+                        flag: "--beta".into(),
+                        required: true,
+                        arg_type: LoadedArgType::Enum {
+                            values: vec!["b".into()],
+                        },
+                    },
+                ],
+            }],
+        };
+        let result = validate(&req("multi", vec![]), &config);
+        match result {
+            Err(ValidationError::MissingRequiredArgs(mut args)) => {
+                args.sort();
+                assert_eq!(args, vec!["alpha", "beta"]);
+            }
+            other => panic!(
+                "expected MissingRequiredArgs with two entries, got {:?}",
+                other
+            ),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Metacharacter check on Path args
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn metachar_semicolon_in_path_rejected() {
+        // A semicolon in a path argument must be caught by the metacharacter
+        // guard before path resolution runs.
+        let config = test_config();
+        assert_metachar_error(validate(
+            &req(
+                "greet",
+                vec![
+                    ("format", json!("text")),
+                    ("output", json!("/tmp;rm -rf /")),
+                ],
+            ),
+            &config,
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // Path traversal test
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn path_dotdot_outside_allowed_rejected() {
+        // /tmp/../usr canonicalises to /usr (outside the allowed /tmp tree).
+        // The validator must detect this even though the raw string starts with
+        // "/tmp/".
+        let config = test_config();
+        let result = validate(
+            &req(
+                "greet",
+                vec![("format", json!("text")), ("output", json!("/tmp/../usr"))],
+            ),
+            &config,
+        );
+        assert!(
+            matches!(result, Err(ValidationError::InvalidArgValue { .. })),
+            "expected InvalidArgValue for dotdot traversal path, got {:?}",
+            result
+        );
+    }
 }

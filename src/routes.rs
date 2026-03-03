@@ -13,12 +13,15 @@
 //!
 //! # Error responses
 //!
-//! All error responses (including Rocket's built-in catchers) use the same
-//! JSON envelope:
+//! Error responses for the statuses handled by this module's custom catchers
+//! (401, 404, 422, 500) all use the same JSON envelope:
 //!
 //! ```json
 //! {"error": "<human-readable message>"}
 //! ```
+//!
+//! Other error statuses (e.g. 400 for a syntactically invalid JSON body) fall
+//! through to Rocket's default catcher and may return a plain-text body.
 
 use std::collections::HashMap;
 
