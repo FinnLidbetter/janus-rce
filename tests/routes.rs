@@ -16,6 +16,8 @@ fn test_config() -> LoadedConfig {
             port: 8080,
             bind: "127.0.0.1".into(),
             token: None,
+            concurrent_jobs_max: None,
+            output_bytes_max: None,
         },
         token: TEST_TOKEN.into(),
         commands: vec![
@@ -25,6 +27,7 @@ fn test_config() -> LoadedConfig {
                 working_dir: None,
                 args: vec![],
                 fixed_args: vec![],
+                timeout_secs: None,
             },
             LoadedCommandSpec {
                 name: "fail".into(),
@@ -32,6 +35,7 @@ fn test_config() -> LoadedConfig {
                 working_dir: None,
                 args: vec![],
                 fixed_args: vec![],
+                timeout_secs: None,
             },
             LoadedCommandSpec {
                 name: "greet".into(),
@@ -46,6 +50,7 @@ fn test_config() -> LoadedConfig {
                     },
                 }],
                 fixed_args: vec![],
+                timeout_secs: None,
             },
         ],
     }
@@ -362,6 +367,8 @@ async fn env_isolation_strips_parent_environment() {
             port: 0,
             bind: "127.0.0.1".into(),
             token: None,
+            concurrent_jobs_max: None,
+            output_bytes_max: None,
         },
         token: TEST_TOKEN.into(),
         commands: vec![LoadedCommandSpec {
@@ -370,6 +377,7 @@ async fn env_isolation_strips_parent_environment() {
             working_dir: None,
             args: vec![],
             fixed_args: vec![],
+            timeout_secs: None,
         }],
     };
     let client = Client::tracked(janus_rce::build_rocket(rocket::Config::figment(), config))
@@ -420,6 +428,8 @@ async fn run_killed_on_shutdown() {
             port: 0,
             bind: "127.0.0.1".into(),
             token: None,
+            concurrent_jobs_max: None,
+            output_bytes_max: None,
         },
         token: TEST_TOKEN.into(),
         commands: vec![LoadedCommandSpec {
@@ -428,6 +438,7 @@ async fn run_killed_on_shutdown() {
             working_dir: None,
             args: vec![],
             fixed_args: vec![],
+            timeout_secs: None,
         }],
     };
     let client = Client::tracked(janus_rce::build_rocket(rocket::Config::figment(), config))
@@ -474,5 +485,174 @@ async fn run_killed_on_shutdown() {
     assert!(
         events.iter().any(|e| e["type"] == "stdout"),
         "expected stdout events from yes(1) before shutdown, got: {events:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent-job limit — 429 when all slots are occupied
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn run_at_capacity_returns_429() {
+    // concurrent_jobs_max = 0 means no slots are ever available, so every
+    // request is rejected immediately with 429.
+    let config = LoadedConfig {
+        server: ServerConfig {
+            port: 0,
+            bind: "127.0.0.1".into(),
+            token: None,
+            concurrent_jobs_max: Some(0),
+            output_bytes_max: None,
+        },
+        token: TEST_TOKEN.into(),
+        commands: vec![LoadedCommandSpec {
+            name: "succeed".into(),
+            executable: PathBuf::from("/usr/bin/true"),
+            working_dir: None,
+            args: vec![],
+            fixed_args: vec![],
+            timeout_secs: None,
+        }],
+    };
+    let client = Client::tracked(janus_rce::build_rocket(rocket::Config::figment(), config))
+        .await
+        .expect("valid rocket instance");
+    let response = client
+        .post("/run")
+        .header(ContentType::JSON)
+        .header(auth_header(TEST_TOKEN))
+        .body(r#"{"command":"succeed"}"#)
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::TooManyRequests);
+}
+
+// ---------------------------------------------------------------------------
+// Per-command timeout — child killed, exit code null
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn run_timeout_kills_child() {
+    use std::time::Duration as StdDuration;
+
+    let config = LoadedConfig {
+        server: ServerConfig {
+            port: 0,
+            bind: "127.0.0.1".into(),
+            token: None,
+            concurrent_jobs_max: None,
+            output_bytes_max: None,
+        },
+        token: TEST_TOKEN.into(),
+        commands: vec![LoadedCommandSpec {
+            name: "yes".into(),
+            executable: PathBuf::from("/usr/bin/yes"),
+            working_dir: None,
+            args: vec![],
+            fixed_args: vec![],
+            // 1-second timeout on a command that would otherwise run forever.
+            timeout_secs: Some(1),
+        }],
+    };
+    let client = Client::tracked(janus_rce::build_rocket(rocket::Config::figment(), config))
+        .await
+        .expect("valid rocket instance");
+
+    let wall_start = std::time::Instant::now();
+
+    let response = tokio::time::timeout(
+        StdDuration::from_secs(10),
+        client
+            .post("/run")
+            .header(ContentType::JSON)
+            .header(auth_header(TEST_TOKEN))
+            .body(r#"{"command":"yes"}"#)
+            .dispatch(),
+    )
+    .await
+    .expect("response received within 10 s");
+
+    assert_eq!(response.status(), Status::Ok);
+
+    let raw = tokio::time::timeout(StdDuration::from_secs(10), response.into_string())
+        .await
+        .expect("body drained within 10 s")
+        .unwrap_or_default();
+
+    let events = parse_sse(&raw);
+    let last = events.last().expect("at least one SSE event");
+    assert_eq!(last["type"], "exit", "final event must be exit");
+    assert!(
+        last["code"].is_null(),
+        "exit code must be null for a timed-out command, got: {}",
+        last["code"],
+    );
+
+    // The stream must have ended well before the fallback 10 s guard.
+    assert!(
+        wall_start.elapsed() < StdDuration::from_secs(8),
+        "timeout should have fired within ~1 s, not {:?}",
+        wall_start.elapsed(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Output cap — stream terminated, exit code null
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn run_output_cap_terminates_stream() {
+    use std::time::Duration as StdDuration;
+
+    let config = LoadedConfig {
+        server: ServerConfig {
+            port: 0,
+            bind: "127.0.0.1".into(),
+            token: None,
+            concurrent_jobs_max: None,
+            // 10-byte cap: the very first line from yes(1) ("y") is 1 byte,
+            // so the cap fires after 11 lines (cumulative > 10).
+            output_bytes_max: Some(10),
+        },
+        token: TEST_TOKEN.into(),
+        commands: vec![LoadedCommandSpec {
+            name: "yes".into(),
+            executable: PathBuf::from("/usr/bin/yes"),
+            working_dir: None,
+            args: vec![],
+            fixed_args: vec![],
+            timeout_secs: None,
+        }],
+    };
+    let client = Client::tracked(janus_rce::build_rocket(rocket::Config::figment(), config))
+        .await
+        .expect("valid rocket instance");
+
+    let response = tokio::time::timeout(
+        StdDuration::from_secs(10),
+        client
+            .post("/run")
+            .header(ContentType::JSON)
+            .header(auth_header(TEST_TOKEN))
+            .body(r#"{"command":"yes"}"#)
+            .dispatch(),
+    )
+    .await
+    .expect("response received within 10 s");
+
+    assert_eq!(response.status(), Status::Ok);
+
+    let raw = tokio::time::timeout(StdDuration::from_secs(10), response.into_string())
+        .await
+        .expect("body drained within 10 s")
+        .unwrap_or_default();
+
+    let events = parse_sse(&raw);
+    let last = events.last().expect("at least one SSE event");
+    assert_eq!(last["type"], "exit", "final event must be exit");
+    assert!(
+        last["code"].is_null(),
+        "exit code must be null when output cap is exceeded, got: {}",
+        last["code"],
     );
 }

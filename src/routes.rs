@@ -24,17 +24,51 @@
 //! through to Rocket's default catcher and may return a plain-text body.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rocket::http::Status;
 use rocket::response::stream::EventStream;
 use rocket::serde::json::Json;
 use rocket::{Shutdown, State, catch, get, post};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::auth::AuthToken;
 use crate::config::LoadedConfig;
 use crate::executor;
 use crate::validate::{self, ValidationError};
+
+// ---------------------------------------------------------------------------
+// Concurrent-job limiter
+// ---------------------------------------------------------------------------
+
+/// Manages the pool of available concurrent-job slots for `POST /run`.
+///
+/// When `concurrent_jobs_max` is `None` in the server config, the limiter is
+/// unconfigured and all requests proceed without acquiring a permit.  When it
+/// is `Some(n)`, a semaphore of size `n` is created; requests that cannot
+/// obtain a slot immediately are rejected with `429 Too Many Requests`.
+pub struct JobLimiter(Option<Arc<Semaphore>>);
+
+impl JobLimiter {
+    /// Creates a new limiter.  `jobs_max = None` means no limit.
+    pub fn new(jobs_max: Option<u32>) -> Self {
+        Self(jobs_max.map(|n| Arc::new(Semaphore::new(n as usize))))
+    }
+
+    /// Attempts to acquire a job slot without blocking.
+    ///
+    /// * `Ok(None)` — no limit configured; caller may proceed freely.
+    /// * `Ok(Some(permit))` — slot acquired; it is released when `permit` is dropped.
+    /// * `Err(())` — at capacity; caller should respond with `429`.
+    #[allow(clippy::result_unit_err)]
+    pub fn try_acquire(&self) -> Result<Option<OwnedSemaphorePermit>, ()> {
+        match &self.0 {
+            None => Ok(None),
+            Some(sem) => sem.clone().try_acquire_owned().map(Some).map_err(|_| ()),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -148,8 +182,19 @@ pub fn run(
     _auth: AuthToken,
     request: Json<RunRequest>,
     config: &State<LoadedConfig>,
+    limiter: &State<JobLimiter>,
     shutdown: Shutdown,
 ) -> Result<EventStream![], (Status, Json<ErrorBody>)> {
+    // Reject immediately if all concurrent-job slots are occupied.
+    let permit = limiter.inner().try_acquire().map_err(|()| {
+        (
+            Status::TooManyRequests,
+            Json(ErrorBody {
+                error: "server is at maximum concurrent job capacity".into(),
+            }),
+        )
+    })?;
+
     let validated = match validate::validate(&request, config) {
         Ok(v) => v,
         Err(ValidationError::CommandNotFound) => {
@@ -186,7 +231,7 @@ pub fn run(
         }
     };
 
-    Ok(executor::run_command(validated, shutdown))
+    Ok(executor::run_command(validated, shutdown, permit))
 }
 
 // ---------------------------------------------------------------------------

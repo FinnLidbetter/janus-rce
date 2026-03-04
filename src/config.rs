@@ -49,6 +49,17 @@ pub struct ServerConfig {
     /// Static bearer token.  May be `None` when the token is supplied via the
     /// `JANUS_TOKEN` environment variable instead.
     pub token: Option<String>,
+    /// Maximum number of simultaneous `POST /run` jobs.
+    /// Requests that arrive when all slots are occupied are rejected with
+    /// `429 Too Many Requests`.  `None` means no limit.
+    #[serde(default)]
+    pub concurrent_jobs_max: Option<u32>,
+    /// Maximum combined stdout + stderr bytes streamed per request.
+    /// When the limit is exceeded the child process is killed and the stream
+    /// ends with an `exit` event carrying a `null` code.  `None` means no
+    /// limit.
+    #[serde(default)]
+    pub output_bytes_max: Option<u64>,
 }
 
 fn default_bind() -> String {
@@ -72,6 +83,11 @@ pub struct CommandSpec {
     /// user-supplied arguments.  Not user-controlled.
     #[serde(default)]
     pub fixed_args: Vec<String>,
+    /// Maximum wall-clock seconds this command may run.  When the limit is
+    /// exceeded the child process is killed and the stream ends with an `exit`
+    /// event carrying a `null` code.  `None` means no timeout.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Raw argument specification within a `[[commands]]` entry.
@@ -153,6 +169,9 @@ pub struct LoadedCommandSpec {
     /// Server-side positional words prepended to `argv` before any
     /// user-supplied arguments.  Not user-controlled.
     pub fixed_args: Vec<String>,
+    /// Maximum wall-clock seconds this command may run, or `None` for no
+    /// timeout.
+    pub timeout_secs: Option<u64>,
 }
 
 /// A validated argument specification with pre-compiled validation data.
@@ -282,7 +301,7 @@ impl LoadedConfig {
     /// use std::path::PathBuf;
     ///
     /// let config = LoadedConfig {
-    ///     server: ServerConfig { port: 8080, bind: "127.0.0.1".into(), token: None },
+    ///     server: ServerConfig { port: 8080, bind: "127.0.0.1".into(), token: None, concurrent_jobs_max: None, output_bytes_max: None },
     ///     token: "s".into(),
     ///     commands: vec![LoadedCommandSpec {
     ///         name: "ping".into(),
@@ -290,6 +309,7 @@ impl LoadedConfig {
     ///         working_dir: None,
     ///         args: vec![],
     ///         fixed_args: vec![],
+    ///         timeout_secs: None,
     ///     }],
     /// };
     ///
@@ -359,6 +379,7 @@ impl LoadedCommandSpec {
             working_dir: spec.working_dir.clone(),
             args,
             fixed_args: spec.fixed_args.clone(),
+            timeout_secs: spec.timeout_secs,
         })
     }
 }
@@ -456,6 +477,7 @@ mod tests {
             working_dir,
             args: vec![],
             fixed_args: vec![],
+            timeout_secs: None,
         }
     }
 
@@ -504,6 +526,7 @@ mod tests {
             working_dir: None,
             args: vec![],
             fixed_args: vec![],
+            timeout_secs: None,
         }
     }
 

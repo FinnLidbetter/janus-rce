@@ -27,6 +27,8 @@ use rocket::response::stream::{Event, EventStream};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::LinesStream;
 
@@ -92,8 +94,16 @@ enum Tagged {
 /// The `shutdown` handle is obtained from Rocket's managed shutdown mechanism.
 /// When the server begins shutting down, the running child process is killed
 /// immediately rather than waiting for it to finish naturally.
-pub fn run_command(cmd: ValidatedCommand, mut shutdown: Shutdown) -> EventStream![] {
+pub fn run_command(
+    cmd: ValidatedCommand,
+    mut shutdown: Shutdown,
+    permit: Option<OwnedSemaphorePermit>,
+) -> EventStream![] {
     EventStream! {
+        // Hold the semaphore permit for the lifetime of this stream.
+        // Dropping it at the end releases one concurrent-job slot.
+        let _permit = permit;
+
         let start = std::time::Instant::now();
         tracing::info!(
             command = %cmd.name,
@@ -128,11 +138,18 @@ pub fn run_command(cmd: ValidatedCommand, mut shutdown: Shutdown) -> EventStream
         // Merge interleaves items as they arrive.
         let mut merged = stdout_stream.merge(stderr_stream);
 
+        // Compute the optional deadline once, before the loop.
+        let deadline: Option<Instant> = cmd.timeout_secs
+            .map(|s| Instant::now() + Duration::from_secs(s));
+
+        let mut output_bytes: u64 = 0;
+        let cap: Option<u64> = cmd.output_bytes_max;
+
         loop {
             tokio::select! {
-                // Check for server shutdown before the next output line so
-                // that in-flight commands are terminated promptly.
+                // Priority order (biased): shutdown > timeout > output.
                 biased;
+
                 _ = &mut shutdown => {
                     tracing::info!(
                         command = %cmd.name,
@@ -141,12 +158,55 @@ pub fn run_command(cmd: ValidatedCommand, mut shutdown: Shutdown) -> EventStream
                     let _ = child.kill().await;
                     return;
                 }
+
+                // Fire when the per-command deadline is reached; pending
+                // forever when no timeout is configured.
+                _ = async {
+                    match deadline {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    tracing::warn!(
+                        command = %cmd.name,
+                        timeout_secs = ?cmd.timeout_secs,
+                        "command timed out",
+                    );
+                    let _ = child.kill().await;
+                    yield Event::json(&OutputEvent::Exit { code: None });
+                    return;
+                }
+
                 result = merged.next() => {
                     match result {
                         Some(Ok(Tagged::Stdout(line))) => {
+                            output_bytes += line.len() as u64;
+                            if cap.is_some_and(|max| output_bytes > max) {
+                                tracing::warn!(
+                                    command = %cmd.name,
+                                    output_bytes,
+                                    cap = ?cap,
+                                    "output cap exceeded",
+                                );
+                                let _ = child.kill().await;
+                                yield Event::json(&OutputEvent::Exit { code: None });
+                                return;
+                            }
                             yield Event::json(&OutputEvent::Stdout { data: line });
                         }
                         Some(Ok(Tagged::Stderr(line))) => {
+                            output_bytes += line.len() as u64;
+                            if cap.is_some_and(|max| output_bytes > max) {
+                                tracing::warn!(
+                                    command = %cmd.name,
+                                    output_bytes,
+                                    cap = ?cap,
+                                    "output cap exceeded",
+                                );
+                                let _ = child.kill().await;
+                                yield Event::json(&OutputEvent::Exit { code: None });
+                                return;
+                            }
                             yield Event::json(&OutputEvent::Stderr { data: line });
                         }
                         Some(Err(e)) => {
@@ -212,6 +272,7 @@ fn spawn_child(cmd: &ValidatedCommand) -> std::io::Result<tokio::process::Child>
     command
         .args(&cmd.argv)
         .current_dir(working_dir)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Clear the server's environment to prevent leaking JANUS_TOKEN and

@@ -38,6 +38,12 @@ pub struct ValidatedCommand {
     /// Flat, ordered list of CLI arguments with no shell interpretation.
     /// Flags and their values appear in config declaration order.
     pub argv: Vec<String>,
+    /// Maximum wall-clock seconds the child may run before being killed.
+    /// `None` means no timeout.
+    pub timeout_secs: Option<u64>,
+    /// Maximum combined stdout + stderr bytes to stream before killing the
+    /// child.  `None` means no limit.
+    pub output_bytes_max: Option<u64>,
 }
 
 /// Errors that [`validate`] can return.
@@ -125,7 +131,7 @@ fn reject_shell_metacharacters(arg: &str, value: &str) -> Result<(), ValidationE
 /// use std::path::PathBuf;
 ///
 /// let config = LoadedConfig {
-///     server: ServerConfig { port: 8080, bind: "127.0.0.1".into(), token: None },
+///     server: ServerConfig { port: 8080, bind: "127.0.0.1".into(), token: None, concurrent_jobs_max: None, output_bytes_max: None },
 ///     token: "secret".into(),
 ///     commands: vec![LoadedCommandSpec {
 ///         name: "ping".into(),
@@ -133,6 +139,7 @@ fn reject_shell_metacharacters(arg: &str, value: &str) -> Result<(), ValidationE
 ///         working_dir: None,
 ///         args: vec![],
 ///         fixed_args: vec![],
+///         timeout_secs: None,
 ///     }],
 /// };
 ///
@@ -279,6 +286,8 @@ pub fn validate(
         executable: spec.executable.clone(),
         working_dir: spec.working_dir.clone(),
         argv,
+        timeout_secs: spec.timeout_secs,
+        output_bytes_max: config.server.output_bytes_max,
     })
 }
 
@@ -303,6 +312,8 @@ mod tests {
                 port: 8080,
                 bind: "127.0.0.1".into(),
                 token: None,
+                concurrent_jobs_max: None,
+                output_bytes_max: None,
             },
             token: "test-token".into(),
             commands: vec![LoadedCommandSpec {
@@ -342,6 +353,7 @@ mod tests {
                     },
                 ],
                 fixed_args: vec!["--greet".into()],
+                timeout_secs: None,
             }],
         }
     }
@@ -745,6 +757,8 @@ mod tests {
                 port: 8080,
                 bind: "127.0.0.1".into(),
                 token: None,
+                concurrent_jobs_max: None,
+                output_bytes_max: None,
             },
             token: "test-token".into(),
             commands: vec![LoadedCommandSpec {
@@ -752,6 +766,7 @@ mod tests {
                 executable: PathBuf::from("/usr/bin/true"),
                 working_dir: None,
                 fixed_args: vec![],
+                timeout_secs: None,
                 args: vec![
                     LoadedArgSpec {
                         name: "alpha".into(),

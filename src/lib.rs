@@ -57,8 +57,10 @@ pub fn build_rocket(
     figment: rocket::figment::Figment,
     config: config::LoadedConfig,
 ) -> rocket::Rocket<rocket::Build> {
+    let limiter = routes::JobLimiter::new(config.server.concurrent_jobs_max);
     rocket::custom(figment)
         .manage(config)
+        .manage(limiter)
         .mount(
             "/",
             rocket::routes![routes::health, routes::commands, routes::run],
