@@ -23,6 +23,7 @@ fn test_config() -> LoadedConfig {
         commands: vec![
             LoadedCommandSpec {
                 name: "succeed".into(),
+                description: None,
                 executable: PathBuf::from("/usr/bin/true"),
                 working_dir: None,
                 args: vec![],
@@ -31,6 +32,7 @@ fn test_config() -> LoadedConfig {
             },
             LoadedCommandSpec {
                 name: "fail".into(),
+                description: None,
                 executable: PathBuf::from("/usr/bin/false"),
                 working_dir: None,
                 args: vec![],
@@ -39,10 +41,12 @@ fn test_config() -> LoadedConfig {
             },
             LoadedCommandSpec {
                 name: "greet".into(),
+                description: Some("Greets the caller.".into()),
                 executable: PathBuf::from("/usr/bin/true"),
                 working_dir: None,
                 args: vec![LoadedArgSpec {
                     name: "format".into(),
+                    description: Some("Output format to use.".into()),
                     flag: "--format".into(),
                     required: true,
                     arg_type: LoadedArgType::Enum {
@@ -50,7 +54,7 @@ fn test_config() -> LoadedConfig {
                     },
                 }],
                 fixed_args: vec![],
-                timeout_secs: None,
+                timeout_secs: Some(30),
             },
         ],
     }
@@ -124,6 +128,67 @@ async fn commands_ok() {
     let names: Vec<&str> = body.iter().map(|c| c["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"succeed"));
     assert!(names.contains(&"fail"));
+}
+
+// ---------------------------------------------------------------------------
+// /commands — within directories for path args
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn commands_path_arg_exposes_within() {
+    let config = LoadedConfig {
+        server: ServerConfig {
+            port: 0,
+            bind: "127.0.0.1".into(),
+            token: None,
+            concurrent_jobs_max: None,
+            output_bytes_max: None,
+        },
+        token: TEST_TOKEN.into(),
+        commands: vec![LoadedCommandSpec {
+            name: "write".into(),
+            description: None,
+            executable: PathBuf::from("/usr/bin/true"),
+            working_dir: None,
+            args: vec![LoadedArgSpec {
+                name: "output".into(),
+                description: None,
+                flag: "--output".into(),
+                required: false,
+                arg_type: LoadedArgType::Path {
+                    within: vec![PathBuf::from("/tmp").canonicalize().unwrap()],
+                },
+            }],
+            fixed_args: vec![],
+            timeout_secs: None,
+        }],
+    };
+    let client = Client::tracked(janus_rce::build_rocket(rocket::Config::figment(), config))
+        .await
+        .expect("valid rocket instance");
+    let response = client
+        .get("/commands")
+        .header(auth_header(TEST_TOKEN))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let body: Vec<Value> = serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+    let cmd = body.iter().find(|c| c["name"] == "write").unwrap();
+    let arg = &cmd["args"][0];
+    assert_eq!(arg["type"], "path");
+    let within = arg["within"].as_array().expect("within must be an array");
+    assert!(
+        !within.is_empty(),
+        "within must list at least one directory"
+    );
+    assert!(
+        arg["values"].is_null(),
+        "values must be absent for path args"
+    );
+    assert!(
+        arg["pattern"].is_null(),
+        "pattern must be absent for path args"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +325,7 @@ async fn commands_response_arg_structure() {
     let args = greet["args"].as_array().expect("args must be a JSON array");
     assert_eq!(args.len(), 1, "greet has exactly one arg");
     assert_eq!(args[0]["name"], "format");
+    assert_eq!(args[0]["description"], "Output format to use.");
     assert_eq!(args[0]["required"], true);
     assert_eq!(args[0]["type"], "enum");
     assert_eq!(
@@ -271,6 +337,14 @@ async fn commands_response_arg_structure() {
         args[0]["pattern"].is_null(),
         "pattern must be absent for enum args",
     );
+    assert!(
+        args[0]["within"].is_null(),
+        "within must be absent for enum args",
+    );
+
+    // The greet command has a description and timeout.
+    assert_eq!(greet["description"], "Greets the caller.");
+    assert_eq!(greet["timeout_secs"], 30);
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +456,7 @@ async fn env_isolation_strips_parent_environment() {
         token: TEST_TOKEN.into(),
         commands: vec![LoadedCommandSpec {
             name: "env".into(),
+            description: None,
             executable: PathBuf::from("/usr/bin/env"),
             working_dir: None,
             args: vec![],
@@ -443,6 +518,7 @@ async fn run_killed_on_shutdown() {
         token: TEST_TOKEN.into(),
         commands: vec![LoadedCommandSpec {
             name: "yes".into(),
+            description: None,
             executable: PathBuf::from("/usr/bin/yes"),
             working_dir: None,
             args: vec![],
@@ -516,6 +592,7 @@ async fn run_at_capacity_returns_429() {
         token: TEST_TOKEN.into(),
         commands: vec![LoadedCommandSpec {
             name: "succeed".into(),
+            description: None,
             executable: PathBuf::from("/usr/bin/true"),
             working_dir: None,
             args: vec![],
@@ -555,6 +632,7 @@ async fn run_timeout_kills_child() {
         token: TEST_TOKEN.into(),
         commands: vec![LoadedCommandSpec {
             name: "yes".into(),
+            description: None,
             executable: PathBuf::from("/usr/bin/yes"),
             working_dir: None,
             args: vec![],
@@ -626,6 +704,7 @@ async fn run_output_cap_terminates_stream() {
         token: TEST_TOKEN.into(),
         commands: vec![LoadedCommandSpec {
             name: "yes".into(),
+            description: None,
             executable: PathBuf::from("/usr/bin/yes"),
             working_dir: None,
             args: vec![],

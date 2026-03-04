@@ -135,6 +135,7 @@ fn reject_shell_metacharacters(arg: &str, value: &str) -> Result<(), ValidationE
 ///     token: "secret".into(),
 ///     commands: vec![LoadedCommandSpec {
 ///         name: "ping".into(),
+///         description: None,
 ///         executable: PathBuf::from("/usr/bin/true"),
 ///         working_dir: None,
 ///         args: vec![],
@@ -318,11 +319,13 @@ mod tests {
             token: "test-token".into(),
             commands: vec![LoadedCommandSpec {
                 name: "greet".into(),
+                description: None,
                 executable: PathBuf::from("/usr/bin/true"),
                 working_dir: None,
                 args: vec![
                     LoadedArgSpec {
                         name: "format".into(),
+                        description: None,
                         flag: "--format".into(),
                         required: true,
                         arg_type: LoadedArgType::Enum {
@@ -331,6 +334,7 @@ mod tests {
                     },
                     LoadedArgSpec {
                         name: "name".into(),
+                        description: None,
                         flag: "--name".into(),
                         required: false,
                         arg_type: LoadedArgType::Pattern {
@@ -339,12 +343,14 @@ mod tests {
                     },
                     LoadedArgSpec {
                         name: "verbose".into(),
+                        description: None,
                         flag: "--verbose".into(),
                         required: false,
                         arg_type: LoadedArgType::Bool,
                     },
                     LoadedArgSpec {
                         name: "output".into(),
+                        description: None,
                         flag: "--output".into(),
                         required: false,
                         arg_type: LoadedArgType::Path {
@@ -763,6 +769,7 @@ mod tests {
             token: "test-token".into(),
             commands: vec![LoadedCommandSpec {
                 name: "multi".into(),
+                description: None,
                 executable: PathBuf::from("/usr/bin/true"),
                 working_dir: None,
                 fixed_args: vec![],
@@ -770,6 +777,7 @@ mod tests {
                 args: vec![
                     LoadedArgSpec {
                         name: "alpha".into(),
+                        description: None,
                         flag: "--alpha".into(),
                         required: true,
                         arg_type: LoadedArgType::Enum {
@@ -778,6 +786,7 @@ mod tests {
                     },
                     LoadedArgSpec {
                         name: "beta".into(),
+                        description: None,
                         flag: "--beta".into(),
                         required: true,
                         arg_type: LoadedArgType::Enum {

@@ -24,6 +24,7 @@
 //! through to Rocket's default catcher and may return a plain-text body.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rocket::http::Status;
@@ -107,6 +108,13 @@ pub struct HealthResponse {
 pub struct CommandInfo {
     /// Command name used in `POST /run` requests.
     pub name: String,
+    /// Human-readable description of what the command does, if provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Maximum wall-clock seconds this command may run before being killed,
+    /// if configured.  Absent means no timeout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
     /// Declared arguments in config order.
     pub args: Vec<ArgInfo>,
 }
@@ -116,6 +124,9 @@ pub struct CommandInfo {
 pub struct ArgInfo {
     /// Argument name used in the `args` map of a `POST /run` request.
     pub name: String,
+    /// Human-readable description of the argument, if provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Whether the argument must be supplied.
     pub required: bool,
     /// Validation type: `"enum"`, `"pattern"`, `"path"`, or `"bool"`.
@@ -129,6 +140,10 @@ pub struct ArgInfo {
     /// only for `"pattern"` arguments; absent for all other types.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    /// Directories the path value must resolve within.  Present only for
+    /// `"path"` arguments; absent for all other types.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub within: Option<Vec<PathBuf>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -155,23 +170,28 @@ pub fn commands(_auth: AuthToken, config: &State<LoadedConfig>) -> Json<Vec<Comm
         .iter()
         .map(|cmd| CommandInfo {
             name: cmd.name.clone(),
+            description: cmd.description.clone(),
+            timeout_secs: cmd.timeout_secs,
             args: cmd
                 .args
                 .iter()
                 .map(|a| {
-                    let (values, pattern) = match &a.arg_type {
-                        LoadedArgType::Enum { values } => (Some(values.clone()), None),
+                    let (values, pattern, within) = match &a.arg_type {
+                        LoadedArgType::Enum { values } => (Some(values.clone()), None, None),
                         LoadedArgType::Pattern { compiled } => {
-                            (None, Some(compiled.as_str().to_string()))
+                            (None, Some(compiled.as_str().to_string()), None)
                         }
-                        LoadedArgType::Path { .. } | LoadedArgType::Bool => (None, None),
+                        LoadedArgType::Path { within } => (None, None, Some(within.clone())),
+                        LoadedArgType::Bool => (None, None, None),
                     };
                     ArgInfo {
                         name: a.name.clone(),
+                        description: a.description.clone(),
                         required: a.required,
                         arg_type: a.arg_type.type_name(),
                         values,
                         pattern,
+                        within,
                     }
                 })
                 .collect(),

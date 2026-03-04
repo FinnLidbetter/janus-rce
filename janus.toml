@@ -36,6 +36,9 @@ bind = "127.0.0.1"
 name = "build"
 executable = "/usr/bin/xcodebuild"
 working_dir = "/path/to/your/project"
+# Human-readable description returned by GET /commands. Helps callers
+# (including AI agents) understand when and why to invoke this command.
+# description = "Builds the app for the selected scheme and configuration."
 # Maximum wall-clock seconds this command may run before it is killed.
 # Omit for no timeout.
 # timeout_secs = 300
@@ -47,6 +50,7 @@ working_dir = "/path/to/your/project"
   required = true
   type = "enum"
   values = ["MyApp", "MyAppTests"]
+  # description = "The Xcode scheme to build."
 
   # Build configuration; optional (xcodebuild defaults to Debug).
   [[commands.args]]

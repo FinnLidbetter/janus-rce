@@ -71,6 +71,11 @@ fn default_bind() -> String {
 pub struct CommandSpec {
     /// Name used in API requests (`{"command": "<name>"}`).
     pub name: String,
+    /// Human-readable description of the command returned by `GET /commands`.
+    /// Intended to help callers (including AI agents) understand when and why
+    /// to invoke this command.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Absolute path to the executable.
     pub executable: PathBuf,
     /// Optional working directory; defaults to `/` when absent.
@@ -95,6 +100,9 @@ pub struct CommandSpec {
 pub struct ArgSpec {
     /// Argument name used in the JSON request body.
     pub name: String,
+    /// Human-readable description of the argument returned by `GET /commands`.
+    #[serde(default)]
+    pub description: Option<String>,
     /// CLI flag passed to the executable (e.g. `"--output"`).
     #[serde(default)]
     pub flag: String,
@@ -159,6 +167,8 @@ pub struct LoadedConfig {
 pub struct LoadedCommandSpec {
     /// Command name as it appears in API requests.
     pub name: String,
+    /// Human-readable description of the command, or `None` if not provided.
+    pub description: Option<String>,
     /// Absolute path to the executable, verified to exist and be runnable at
     /// load time.
     pub executable: PathBuf,
@@ -178,6 +188,8 @@ pub struct LoadedCommandSpec {
 pub struct LoadedArgSpec {
     /// Argument name as it appears in JSON requests.
     pub name: String,
+    /// Human-readable description of the argument, or `None` if not provided.
+    pub description: Option<String>,
     /// CLI flag appended to `argv` (e.g. `"--output"`).
     ///
     /// For `enum`, `pattern`, and `path` arguments the flag is followed by the
@@ -305,6 +317,7 @@ impl LoadedConfig {
     ///     token: "s".into(),
     ///     commands: vec![LoadedCommandSpec {
     ///         name: "ping".into(),
+    ///         description: None,
     ///         executable: PathBuf::from("/usr/bin/true"),
     ///         working_dir: None,
     ///         args: vec![],
@@ -375,6 +388,7 @@ impl LoadedCommandSpec {
 
         Ok(LoadedCommandSpec {
             name: spec.name.clone(),
+            description: spec.description.clone(),
             executable: spec.executable.clone(),
             working_dir: spec.working_dir.clone(),
             args,
@@ -420,6 +434,7 @@ impl LoadedArgSpec {
 
         Ok(LoadedArgSpec {
             name: spec.name.clone(),
+            description: spec.description.clone(),
             flag: spec.flag.clone(),
             required: spec.required,
             arg_type,
@@ -473,6 +488,7 @@ mod tests {
     fn minimal_spec(working_dir: Option<PathBuf>) -> CommandSpec {
         CommandSpec {
             name: "cmd".into(),
+            description: None,
             executable: PathBuf::from("/usr/bin/true"),
             working_dir,
             args: vec![],
@@ -522,6 +538,7 @@ mod tests {
     fn cmd_spec(executable: PathBuf) -> CommandSpec {
         CommandSpec {
             name: "cmd".into(),
+            description: None,
             executable,
             working_dir: None,
             args: vec![],
@@ -603,6 +620,7 @@ mod tests {
     fn minimal_arg_spec(arg_type: ArgType) -> ArgSpec {
         ArgSpec {
             name: "test_arg".into(),
+            description: None,
             flag: "--test".into(),
             required: false,
             arg_type,
