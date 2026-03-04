@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::auth::AuthToken;
-use crate::config::LoadedConfig;
+use crate::config::{LoadedArgType, LoadedConfig};
 use crate::executor;
 use crate::validate::{self, ValidationError};
 
@@ -121,6 +121,14 @@ pub struct ArgInfo {
     /// Validation type: `"enum"`, `"pattern"`, `"path"`, or `"bool"`.
     #[serde(rename = "type")]
     pub arg_type: &'static str,
+    /// Exhaustive list of accepted string values.  Present only for `"enum"`
+    /// arguments; absent for all other types.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+    /// Anchored regular expression the value must match in full.  Present
+    /// only for `"pattern"` arguments; absent for all other types.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,10 +158,21 @@ pub fn commands(_auth: AuthToken, config: &State<LoadedConfig>) -> Json<Vec<Comm
             args: cmd
                 .args
                 .iter()
-                .map(|a| ArgInfo {
-                    name: a.name.clone(),
-                    required: a.required,
-                    arg_type: a.arg_type.type_name(),
+                .map(|a| {
+                    let (values, pattern) = match &a.arg_type {
+                        LoadedArgType::Enum { values } => (Some(values.clone()), None),
+                        LoadedArgType::Pattern { compiled } => {
+                            (None, Some(compiled.as_str().to_string()))
+                        }
+                        LoadedArgType::Path { .. } | LoadedArgType::Bool => (None, None),
+                    };
+                    ArgInfo {
+                        name: a.name.clone(),
+                        required: a.required,
+                        arg_type: a.arg_type.type_name(),
+                        values,
+                        pattern,
+                    }
                 })
                 .collect(),
         })

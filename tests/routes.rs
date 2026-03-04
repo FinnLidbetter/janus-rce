@@ -262,6 +262,15 @@ async fn commands_response_arg_structure() {
     assert_eq!(args[0]["name"], "format");
     assert_eq!(args[0]["required"], true);
     assert_eq!(args[0]["type"], "enum");
+    assert_eq!(
+        args[0]["values"],
+        json!(["text", "json"]),
+        "enum values must be listed",
+    );
+    assert!(
+        args[0]["pattern"].is_null(),
+        "pattern must be absent for enum args",
+    );
 }
 
 // ---------------------------------------------------------------------------
