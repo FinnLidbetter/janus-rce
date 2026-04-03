@@ -36,6 +36,7 @@
 pub mod auth;
 pub mod config;
 pub mod executor;
+pub mod mcp;
 pub mod routes;
 pub mod validate;
 
@@ -63,7 +64,7 @@ pub fn build_rocket(
         .manage(limiter)
         .mount(
             "/",
-            rocket::routes![routes::health, routes::commands, routes::run],
+            rocket::routes![routes::health, routes::commands, routes::run, mcp::mcp_post],
         )
         .register(
             "/",
