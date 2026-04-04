@@ -236,35 +236,19 @@ pub fn run(
 
     let validated = match validate::validate(&request, config) {
         Ok(v) => v,
-        Err(ValidationError::CommandNotFound) => {
+        Err(e @ ValidationError::CommandNotFound(_)) => {
             return Err((
                 Status::NotFound,
                 Json(ErrorBody {
-                    error: format!("command '{}' not found", request.command),
+                    error: e.to_string(),
                 }),
             ));
         }
-        Err(ValidationError::UnknownArgs(args)) => {
+        Err(e) => {
             return Err((
                 Status::UnprocessableEntity,
                 Json(ErrorBody {
-                    error: format!("unknown args: {}", args.join(", ")),
-                }),
-            ));
-        }
-        Err(ValidationError::MissingRequiredArgs(args)) => {
-            return Err((
-                Status::UnprocessableEntity,
-                Json(ErrorBody {
-                    error: format!("missing required args: {}", args.join(", ")),
-                }),
-            ));
-        }
-        Err(ValidationError::InvalidArgValue { arg, reason }) => {
-            return Err((
-                Status::UnprocessableEntity,
-                Json(ErrorBody {
-                    error: format!("invalid value for '{}': {}", arg, reason),
+                    error: e.to_string(),
                 }),
             ));
         }

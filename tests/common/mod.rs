@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use regex::Regex;
 use rocket::http::Header;
 use rocket::local::asynchronous::Client;
 use serde_json::Value;
@@ -57,6 +58,55 @@ pub fn test_config() -> LoadedConfig {
                 }],
                 fixed_args: vec![],
                 timeout_secs: Some(30),
+            },
+            LoadedCommandSpec {
+                name: "check".into(),
+                description: Some("Checks something.".into()),
+                executable: PathBuf::from("/usr/bin/true"),
+                working_dir: None,
+                args: vec![LoadedArgSpec {
+                    name: "verbose".into(),
+                    description: Some("Enable verbose output.".into()),
+                    flag: "--verbose".into(),
+                    required: false,
+                    arg_type: LoadedArgType::Bool,
+                }],
+                fixed_args: vec![],
+                timeout_secs: None,
+            },
+            LoadedCommandSpec {
+                name: "search".into(),
+                description: Some("Searches for a term.".into()),
+                executable: PathBuf::from("/usr/bin/true"),
+                working_dir: None,
+                args: vec![LoadedArgSpec {
+                    name: "query".into(),
+                    description: Some("Search term (lowercase alphanumeric).".into()),
+                    flag: "--query".into(),
+                    required: true,
+                    arg_type: LoadedArgType::Pattern {
+                        compiled: Regex::new("^[a-z0-9]+$").unwrap(),
+                    },
+                }],
+                fixed_args: vec![],
+                timeout_secs: None,
+            },
+            LoadedCommandSpec {
+                name: "read".into(),
+                description: Some("Reads a file from /tmp.".into()),
+                executable: PathBuf::from("/usr/bin/true"),
+                working_dir: None,
+                args: vec![LoadedArgSpec {
+                    name: "file".into(),
+                    description: Some("File to read.".into()),
+                    flag: "--file".into(),
+                    required: true,
+                    arg_type: LoadedArgType::Path {
+                        within: vec![PathBuf::from("/tmp")],
+                    },
+                }],
+                fixed_args: vec![],
+                timeout_secs: None,
             },
         ],
     }

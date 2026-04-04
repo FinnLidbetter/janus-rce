@@ -50,7 +50,8 @@ pub struct ValidatedCommand {
 #[derive(Debug)]
 pub enum ValidationError {
     /// The requested command name was not found in the config.
-    CommandNotFound,
+    /// The inner `String` is the name that was requested.
+    CommandNotFound(String),
     /// The request contained argument keys not declared in the config.
     /// The inner `Vec` lists the unknown names.
     UnknownArgs(Vec<String>),
@@ -65,6 +66,21 @@ pub enum ValidationError {
         /// Human-readable explanation of why the value was rejected.
         reason: String,
     },
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CommandNotFound(name) => write!(f, "command '{name}' not found"),
+            Self::UnknownArgs(args) => write!(f, "unknown args: {}", args.join(", ")),
+            Self::MissingRequiredArgs(args) => {
+                write!(f, "missing required args: {}", args.join(", "))
+            }
+            Self::InvalidArgValue { arg, reason } => {
+                write!(f, "invalid value for '{arg}': {reason}")
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +166,7 @@ fn reject_shell_metacharacters(arg: &str, value: &str) -> Result<(), ValidationE
 ///
 /// // Unknown command.
 /// let bad = RunRequest { command: "rm".into(), args: HashMap::new() };
-/// assert!(matches!(validate::validate(&bad, &config), Err(ValidationError::CommandNotFound)));
+/// assert!(matches!(validate::validate(&bad, &config), Err(ValidationError::CommandNotFound(_))));
 /// ```
 pub fn validate(
     request: &RunRequest,
@@ -159,7 +175,7 @@ pub fn validate(
     // 1. Look up the command.
     let spec = config
         .find_command(&request.command)
-        .ok_or(ValidationError::CommandNotFound)?;
+        .ok_or_else(|| ValidationError::CommandNotFound(request.command.clone()))?;
 
     // 2. Reject any args not declared in the config.
     let declared: std::collections::HashSet<&str> =
@@ -378,7 +394,7 @@ mod tests {
     fn unknown_command() {
         let config = test_config();
         let result = validate(&req("nope", vec![]), &config);
-        assert!(matches!(result, Err(ValidationError::CommandNotFound)));
+        assert!(matches!(result, Err(ValidationError::CommandNotFound(_))));
     }
 
     #[test]

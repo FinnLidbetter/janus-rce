@@ -227,8 +227,9 @@ async fn drain_child(
             result = merged.next() => {
                 match result {
                     Some(Ok(tagged)) => {
+                        // Add 1 for the newline that BufReader::lines() strips.
                         let line_len = match &tagged {
-                            Tagged::Stdout(s) | Tagged::Stderr(s) => s.len(),
+                            Tagged::Stdout(s) | Tagged::Stderr(s) => s.len() + 1,
                         };
                         output_bytes += line_len as u64;
                         if cap.is_some_and(|max| output_bytes > max) {

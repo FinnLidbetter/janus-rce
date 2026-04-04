@@ -60,7 +60,7 @@ use crate::auth::AuthToken;
 use crate::config::{LoadedArgType, LoadedCommandSpec, LoadedConfig};
 use crate::executor::{self, BufferedOutput};
 use crate::routes::{JobLimiter, RunRequest};
-use crate::validate::{self, ValidationError};
+use crate::validate;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC error codes (defined by the JSON-RPC 2.0 spec)
@@ -303,24 +303,10 @@ pub async fn mcp_post(
             let validated = match validate::validate(&run_req, config) {
                 Ok(v) => v,
                 Err(e) => {
-                    let msg_text = match e {
-                        ValidationError::CommandNotFound => {
-                            format!("command '{}' not found", run_req.command)
-                        }
-                        ValidationError::UnknownArgs(args) => {
-                            format!("unknown args: {}", args.join(", "))
-                        }
-                        ValidationError::MissingRequiredArgs(args) => {
-                            format!("missing required args: {}", args.join(", "))
-                        }
-                        ValidationError::InvalidArgValue { arg, reason } => {
-                            format!("invalid value for '{arg}': {reason}")
-                        }
-                    };
                     return Json(ok(
                         id,
                         json!({
-                            "content": [{"type": "text", "text": msg_text}],
+                            "content": [{"type": "text", "text": e.to_string()}],
                             "isError": true,
                         }),
                     ));
