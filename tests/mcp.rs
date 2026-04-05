@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use regex::Regex;
-use rocket::http::{ContentType, Header, Status};
+use rocket::http::{Accept, ContentType, Header, Status};
 use rocket::local::asynchronous::Client;
 use serde_json::{Value, json};
 
@@ -12,7 +12,7 @@ use janus_rce::config::{
     LoadedArgSpec, LoadedArgType, LoadedCommandSpec, LoadedConfig, ServerConfig,
 };
 
-use common::{TEST_TOKEN, auth_header, mcp_msg, post_mcp, test_client};
+use common::{TEST_TOKEN, auth_header, mcp_msg, parse_sse, post_mcp, test_client};
 
 // ---------------------------------------------------------------------------
 // Authentication
@@ -576,6 +576,150 @@ async fn mcp_tools_call_output_cap() {
     assert_eq!(body["result"]["isError"], true);
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("killed"), "got: {text}");
+}
+
+// ---------------------------------------------------------------------------
+// tools/call — SSE streaming (Accept: text/event-stream)
+// ---------------------------------------------------------------------------
+
+#[rocket::async_test]
+async fn mcp_tools_call_sse_returns_event_stream_content_type() {
+    let client = test_client().await;
+    let response = client
+        .post("/mcp")
+        .header(ContentType::JSON)
+        .header(Accept::EventStream)
+        .header(auth_header(TEST_TOKEN))
+        .body(mcp_msg("tools/call", json!({"name": "succeed", "arguments": {}})).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let content_type = response.content_type().unwrap();
+    assert!(
+        content_type.is_event_stream(),
+        "expected text/event-stream, got: {content_type}"
+    );
+}
+
+#[rocket::async_test]
+async fn mcp_tools_call_sse_final_event_is_jsonrpc_response() {
+    let client = test_client().await;
+    let response = client
+        .post("/mcp")
+        .header(ContentType::JSON)
+        .header(Accept::EventStream)
+        .header(auth_header(TEST_TOKEN))
+        .body(mcp_msg("tools/call", json!({"name": "succeed", "arguments": {}})).to_string())
+        .dispatch()
+        .await;
+
+    let body = tokio::time::timeout(std::time::Duration::from_secs(10), response.into_string())
+        .await
+        .expect("response body received within 10 s")
+        .unwrap_or_default();
+
+    let events = parse_sse(&body);
+    assert!(
+        !events.is_empty(),
+        "SSE stream must contain at least one event"
+    );
+
+    // The last event must be the JSON-RPC response matching the request id.
+    let last = events.last().unwrap();
+    assert_eq!(last["jsonrpc"], "2.0", "last event must be JSON-RPC 2.0");
+    assert_eq!(last["id"], 1, "response id must match request id");
+    assert!(last["result"].is_object(), "last event must have a result");
+    assert_eq!(last["result"]["isError"], false);
+    let text = last["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Exit code: 0"), "got: {text}");
+}
+
+#[rocket::async_test]
+async fn mcp_tools_call_sse_stdout_emitted_as_notifications() {
+    let config = janus_rce::config::LoadedConfig {
+        server: janus_rce::config::ServerConfig {
+            port: 0,
+            bind: "127.0.0.1".into(),
+            token: None,
+            concurrent_jobs_max: None,
+            output_bytes_max: None,
+        },
+        token: TEST_TOKEN.into(),
+        commands: vec![janus_rce::config::LoadedCommandSpec {
+            name: "hello".into(),
+            description: None,
+            executable: PathBuf::from("/bin/echo"),
+            working_dir: None,
+            args: vec![],
+            fixed_args: vec!["hello stream".into()],
+            timeout_secs: None,
+        }],
+    };
+    let client = rocket::local::asynchronous::Client::tracked(janus_rce::build_rocket(
+        rocket::Config::figment(),
+        config,
+    ))
+    .await
+    .expect("valid rocket instance");
+
+    let response = client
+        .post("/mcp")
+        .header(ContentType::JSON)
+        .header(Accept::EventStream)
+        .header(auth_header(TEST_TOKEN))
+        .body(mcp_msg("tools/call", json!({"name": "hello", "arguments": {}})).to_string())
+        .dispatch()
+        .await;
+
+    let body = tokio::time::timeout(std::time::Duration::from_secs(10), response.into_string())
+        .await
+        .expect("response body received within 10 s")
+        .unwrap_or_default();
+
+    let events = parse_sse(&body);
+
+    // At least one notifications/message event with the stdout line.
+    let has_notification = events.iter().any(|e| {
+        e["method"] == "notifications/message"
+            && e["params"]["data"]
+                .as_str()
+                .is_some_and(|d: &str| d.contains("hello stream"))
+    });
+    assert!(
+        has_notification,
+        "expected notifications/message with stdout line; events: {events:?}"
+    );
+
+    // The final event must be the JSON-RPC response.
+    let last = events.last().unwrap();
+    assert!(
+        last["result"].is_object(),
+        "last event must be the JSON-RPC response"
+    );
+    let text = last["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("hello stream"),
+        "final response must contain stdout; got: {text}"
+    );
+}
+
+#[rocket::async_test]
+async fn mcp_tools_call_no_sse_header_returns_json() {
+    // Without Accept: text/event-stream the response must be application/json.
+    let client = test_client().await;
+    let response = client
+        .post("/mcp")
+        .header(ContentType::JSON)
+        .header(auth_header(TEST_TOKEN))
+        .body(mcp_msg("tools/call", json!({"name": "succeed", "arguments": {}})).to_string())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    let content_type = response.content_type().unwrap();
+    assert!(
+        content_type.is_json(),
+        "expected application/json without SSE accept header, got: {content_type}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -80,13 +80,13 @@ pub struct BufferedOutput {
 }
 
 // Internal tag used when draining merged streams.
-enum Tagged {
+pub(crate) enum Tagged {
     Stdout(String),
     Stderr(String),
 }
 
 /// Outcome of a [`drain_child`] call.
-enum DrainOutcome {
+pub(crate) enum DrainOutcome {
     /// Process exited naturally or was killed by timeout / output cap.
     /// Callers should emit an exit event with the given code.
     Exited(Option<i32>),
@@ -110,7 +110,7 @@ enum DrainOutcome {
 /// server's process group are not automatically forwarded to child processes.
 ///
 /// [`Child`]: tokio::process::Child
-fn spawn_child(cmd: &ValidatedCommand) -> std::io::Result<tokio::process::Child> {
+pub(crate) fn spawn_child(cmd: &ValidatedCommand) -> std::io::Result<tokio::process::Child> {
     let working_dir = cmd
         .working_dir
         .as_deref()
@@ -175,7 +175,7 @@ fn safe_env() -> Vec<(&'static str, String)> {
 ///
 /// `tx` is dropped when this function returns (naturally or early), which
 /// closes the channel and signals the receiver that no more lines are coming.
-async fn drain_child(
+pub(crate) async fn drain_child(
     name: String,
     timeout_secs: Option<u64>,
     output_bytes_max: Option<u64>,

@@ -11,7 +11,18 @@
 //! | `initialize` | MCP handshake; returns server capabilities |
 //! | `notifications/initialized` | Notification from client; acknowledged silently |
 //! | `tools/list` | Returns all configured commands as MCP tools |
-//! | `tools/call` | Executes a command and returns buffered output |
+//! | `tools/call` | Executes a command; streams output as SSE when accepted, otherwise buffered |
+//!
+//! # Streaming
+//!
+//! When the client sends `Accept: text/event-stream`, `tools/call` returns a
+//! `text/event-stream` response.  As the child process runs, each output line
+//! is emitted as a `notifications/message` JSON-RPC notification so the client
+//! receives progress in real time.  The final event is the JSON-RPC response for
+//! the original request, containing the complete buffered output.
+//!
+//! When the client does not include `text/event-stream` in `Accept`, the
+//! response is a plain `application/json` object (original behaviour).
 //!
 //! # Tool schema
 //!
@@ -51,16 +62,42 @@
 
 use std::collections::HashMap;
 
+use rocket::Request;
+use rocket::request::{FromRequest, Outcome};
+use rocket::response::Responder;
+use rocket::response::stream::{Event, EventStream};
 use rocket::serde::json::Json;
 use rocket::{Shutdown, State, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::auth::AuthToken;
 use crate::config::{LoadedArgType, LoadedCommandSpec, LoadedConfig};
-use crate::executor::{self, BufferedOutput};
+use crate::executor::{self, BufferedOutput, DrainOutcome, Tagged};
 use crate::routes::{JobLimiter, RunRequest};
 use crate::validate;
+
+// ---------------------------------------------------------------------------
+// Response type
+// ---------------------------------------------------------------------------
+
+/// Route return type: either a plain JSON body or an SSE stream.
+enum McpResponse {
+    Json(Json<Value>),
+    Sse(EventStream<UnboundedReceiverStream<Event>>),
+}
+
+impl<'r> Responder<'r, 'r> for McpResponse {
+    fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'r> {
+        match self {
+            McpResponse::Json(j) => j.respond_to(req),
+            McpResponse::Sse(s) => s.respond_to(req),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // JSON-RPC error codes (defined by the JSON-RPC 2.0 spec)
@@ -213,32 +250,225 @@ fn format_output(output: &BufferedOutput) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// SSE streaming support
+// ---------------------------------------------------------------------------
+
+/// Request guard that reports whether the client accepts `text/event-stream`.
+///
+/// Returns `true` when the `Accept` header contains `text/event-stream`.
+/// Never fails: a missing or non-matching `Accept` header yields `false`.
+pub(crate) struct WantsEventStream(bool);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for WantsEventStream {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let wants = req
+            .headers()
+            .get("Accept")
+            .any(|v| v.contains("text/event-stream"));
+        Outcome::Success(WantsEventStream(wants))
+    }
+}
+
+/// Spawns `cmd` and returns a channel-backed stream of MCP SSE events.
+///
+/// While the child process runs, each stdout line is emitted as a
+/// `notifications/message` event at level `"info"` and each stderr line at
+/// level `"warning"`.  When the process finishes the final event is the
+/// JSON-RPC response for the original `tools/call` request (same `id`),
+/// containing the complete buffered output formatted by [`format_output`].
+///
+/// On server shutdown the spawned task exits early without sending the final
+/// response, which closes the channel and terminates the SSE stream.
+fn stream_tools_call(
+    cmd: validate::ValidatedCommand,
+    id: Option<Value>,
+    shutdown: Shutdown,
+    permit: Option<OwnedSemaphorePermit>,
+) -> UnboundedReceiverStream<Event> {
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
+
+    tokio::spawn(async move {
+        let _permit = permit;
+        let start = std::time::Instant::now();
+        tracing::info!(
+            command = %cmd.name,
+            executable = %cmd.executable.display(),
+            argv = ?cmd.argv,
+            "command started (mcp stream)",
+        );
+
+        let child = match executor::spawn_child(&cmd) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    command = %cmd.name,
+                    executable = %cmd.executable.display(),
+                    error = %e,
+                    "failed to spawn command",
+                );
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{"type": "text", "text": format!("failed to spawn command: {e}")}],
+                        "isError": true,
+                    }
+                });
+                let _ = event_tx.send(Event::json(&response).event("message"));
+                return;
+            }
+        };
+
+        let (line_tx, mut line_rx) = mpsc::unbounded_channel::<Tagged>();
+        let name = cmd.name.clone();
+        let drain_fut = executor::drain_child(
+            name.clone(),
+            cmd.timeout_secs,
+            cmd.output_bytes_max,
+            child,
+            shutdown,
+            line_tx,
+        );
+        tokio::pin!(drain_fut);
+
+        let mut outcome: Option<DrainOutcome> = None;
+        let mut stdout_lines: Vec<String> = Vec::new();
+        let mut stderr_lines: Vec<String> = Vec::new();
+
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut drain_fut => {
+                    outcome = Some(result);
+                    break;
+                }
+                tagged = line_rx.recv() => {
+                    match tagged {
+                        Some(Tagged::Stdout(line)) => {
+                            let notif = json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/message",
+                                "params": {"level": "info", "logger": &name, "data": &line}
+                            });
+                            let _ = event_tx.send(Event::json(&notif).event("message"));
+                            stdout_lines.push(line);
+                        }
+                        Some(Tagged::Stderr(line)) => {
+                            let notif = json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/message",
+                                "params": {"level": "warning", "logger": &name, "data": &line}
+                            });
+                            let _ = event_tx.send(Event::json(&notif).event("message"));
+                            stderr_lines.push(line);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        // Drain any lines that arrived after drain_fut completed.
+        while let Some(tagged) = line_rx.recv().await {
+            match tagged {
+                Tagged::Stdout(line) => {
+                    let notif = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/message",
+                        "params": {"level": "info", "logger": &name, "data": &line}
+                    });
+                    let _ = event_tx.send(Event::json(&notif).event("message"));
+                    stdout_lines.push(line);
+                }
+                Tagged::Stderr(line) => {
+                    let notif = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/message",
+                        "params": {"level": "warning", "logger": &name, "data": &line}
+                    });
+                    let _ = event_tx.send(Event::json(&notif).event("message"));
+                    stderr_lines.push(line);
+                }
+            }
+        }
+
+        let exit_code = match outcome {
+            Some(DrainOutcome::Exited(code)) => {
+                tracing::info!(
+                    command = %name,
+                    exit_code = ?code,
+                    duration_ms = start.elapsed().as_millis(),
+                    "command finished (mcp stream)",
+                );
+                code
+            }
+            Some(DrainOutcome::Shutdown) | None => {
+                tracing::info!(command = %name, "mcp stream ended: server shut down");
+                return; // No final response on shutdown.
+            }
+        };
+
+        let buffered = BufferedOutput {
+            stdout_lines,
+            stderr_lines,
+            exit_code,
+        };
+        let is_error = buffered.exit_code.map(|c| c != 0).unwrap_or(true);
+        let text = format_output(&buffered);
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{"type": "text", "text": text}],
+                "isError": is_error,
+            }
+        });
+        let _ = event_tx.send(Event::json(&response).event("message"));
+        // event_tx is dropped here, closing the channel and ending the SSE stream.
+    });
+
+    UnboundedReceiverStream::new(event_rx)
+}
+
+// ---------------------------------------------------------------------------
 // Route handler
 // ---------------------------------------------------------------------------
 
 /// `POST /mcp` — MCP Streamable HTTP transport endpoint.
 ///
 /// Accepts a JSON-RPC 2.0 message, dispatches to the appropriate handler, and
-/// returns a JSON-RPC response.  Notifications (messages without an `id`) are
-/// acknowledged with an empty object `{}`.
+/// returns either a JSON-RPC response or an SSE stream depending on the
+/// `Accept` header and method.
+///
+/// For `tools/call`: when the client sends `Accept: text/event-stream` an SSE
+/// stream is returned.  All other methods and non-SSE calls return JSON.
+///
+/// Notifications (messages without an `id`) are acknowledged with an empty
+/// object `{}`.
 ///
 /// Requires a valid `Authorization: Bearer <token>` header.
+#[allow(private_interfaces)] // WantsEventStream is an internal request guard
 #[post("/mcp", format = "json", data = "<body>")]
 pub async fn mcp_post(
     _auth: AuthToken,
+    wants_sse: WantsEventStream,
     body: Json<JsonRpcMessage>,
     config: &State<LoadedConfig>,
     limiter: &State<JobLimiter>,
     shutdown: Shutdown,
-) -> Json<Value> {
+) -> McpResponse {
     let msg = body.into_inner();
     let id = msg.id;
 
-    Json(match msg.method.as_str() {
+    match msg.method.as_str() {
         // ------------------------------------------------------------------
         // MCP handshake
         // ------------------------------------------------------------------
-        "initialize" => ok(
+        "initialize" => McpResponse::Json(Json(ok(
             id,
             json!({
                 "protocolVersion": "2025-03-26",
@@ -248,17 +478,17 @@ pub async fn mcp_post(
                     "version": env!("CARGO_PKG_VERSION"),
                 },
             }),
-        ),
+        ))),
 
         // Notification: client signals it is ready.  No response body needed.
-        "notifications/initialized" => json!({}),
+        "notifications/initialized" => McpResponse::Json(Json(json!({}))),
 
         // ------------------------------------------------------------------
         // Tool discovery
         // ------------------------------------------------------------------
         "tools/list" => {
             let tools: Vec<Value> = config.commands.iter().map(tool_definition).collect();
-            ok(id, json!({ "tools": tools }))
+            McpResponse::Json(Json(ok(id, json!({ "tools": tools }))))
         }
 
         // ------------------------------------------------------------------
@@ -268,7 +498,11 @@ pub async fn mcp_post(
             let name = match msg.params.get("name").and_then(Value::as_str) {
                 Some(n) => n.to_string(),
                 None => {
-                    return Json(err(id, INVALID_PARAMS, "missing required parameter 'name'"));
+                    return McpResponse::Json(Json(err(
+                        id,
+                        INVALID_PARAMS,
+                        "missing required parameter 'name'",
+                    )));
                 }
             };
 
@@ -276,7 +510,11 @@ pub async fn mcp_post(
                 Some(v) => match serde_json::from_value(v.clone()) {
                     Ok(map) => map,
                     Err(_) => {
-                        return Json(err(id, INVALID_PARAMS, "'arguments' must be an object"));
+                        return McpResponse::Json(Json(err(
+                            id,
+                            INVALID_PARAMS,
+                            "'arguments' must be an object",
+                        )));
                     }
                 },
                 None => HashMap::new(),
@@ -290,51 +528,55 @@ pub async fn mcp_post(
             let permit = match limiter.inner().try_acquire() {
                 Ok(p) => p,
                 Err(()) => {
-                    return Json(ok(
+                    return McpResponse::Json(Json(ok(
                         id,
                         json!({
                             "content": [{"type": "text", "text": "server is at maximum concurrent job capacity"}],
                             "isError": true,
                         }),
-                    ));
+                    )));
                 }
             };
 
             let validated = match validate::validate(&run_req, config) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Json(ok(
+                    return McpResponse::Json(Json(ok(
                         id,
                         json!({
                             "content": [{"type": "text", "text": e.to_string()}],
                             "isError": true,
                         }),
-                    ));
+                    )));
                 }
             };
 
-            let output = executor::run_command_buffered(validated, shutdown, permit).await;
-            let is_error = output.exit_code.map(|c| c != 0).unwrap_or(true);
-            let text = format_output(&output);
-
-            ok(
-                id,
-                json!({
-                    "content": [{"type": "text", "text": text}],
-                    "isError": is_error,
-                }),
-            )
+            if wants_sse.0 {
+                let stream = stream_tools_call(validated, id, shutdown, permit);
+                McpResponse::Sse(EventStream::from(stream))
+            } else {
+                let output = executor::run_command_buffered(validated, shutdown, permit).await;
+                let is_error = output.exit_code.map(|c| c != 0).unwrap_or(true);
+                let text = format_output(&output);
+                McpResponse::Json(Json(ok(
+                    id,
+                    json!({
+                        "content": [{"type": "text", "text": text}],
+                        "isError": is_error,
+                    }),
+                )))
+            }
         }
 
         // ------------------------------------------------------------------
         // Unknown methods
         // ------------------------------------------------------------------
-        method => err(
+        method => McpResponse::Json(Json(err(
             id,
             METHOD_NOT_FOUND,
             &format!("method '{method}' not found"),
-        ),
-    })
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
